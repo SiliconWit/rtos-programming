@@ -1,0 +1,158 @@
+---
+title: "RTOS Programming"
+description: "Master real-time operating systems from scheduling theory to production debugging. Eight lessons covering FreeRTOS and Zephyr: tasks, queues, semaphores, mutexes, memory management, interrupt integration, profiling, and cross-platform portability."
+pubDate: 2026-04-11
+tags: ["rtos", "freertos", "zephyr", "real-time-systems", "embedded-systems", "multitasking", "scheduling", "semaphores", "mutexes", "synchronization", "debugging"]
+excerpt: "Deep dive into real-time operating systems for embedded developers. Eight lessons with hands-on projects covering task scheduling, inter-task communication, synchronization primitives, memory safety, interrupt management, RTOS debugging with Tracealyzer, and portability with Zephyr. The course that separates hobbyists from professionals."
+heroImage: "https://cdn.siliconwit.com/education/pcb-design-kicad/pcb-design-kicad.png"
+---
+
+import Copyright from '../../../../components/Copyright.astro';
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import { Card, CardGrid, Badge, Steps } from '@astrojs/starlight/components';
+
+Most embedded tutorials teach you to blink LEDs. Production firmware runs dozens of concurrent tasks: reading sensors, driving actuators, handling communication, managing power, and responding to user input, all with deterministic timing. This course teaches you to build that kind of firmware correctly, using real-time operating systems. Each lesson builds a working RTOS application on hardware you already own from earlier courses. #RTOS #FreeRTOS #EmbeddedSystems
+
+## Why RTOS?
+
+<CardGrid>
+  <Card title="Beyond Super-Loops" icon="open-book">
+    Bare-metal main loops work until they do not. When you need sensor reads every 10ms, display updates every 50ms, and serial logging every 100ms, all without blocking each other, you need an RTOS. This course teaches you when and why.
+  </Card>
+
+  <Card title="Synchronization Done Right" icon="approve-check">
+    Priority inversion, deadlocks, race conditions, and starvation. These are not textbook concepts; they are bugs that ship in real products. Lesson 4 gives you the mental models and practical patterns to avoid them.
+  </Card>
+
+  <Card title="Debug the Invisible" icon="setting">
+    RTOS bugs are timing bugs. You cannot find them with printf. Lesson 7 teaches you to use Tracealyzer and SystemView to visualize task execution, find priority inversions, and measure jitter. This lesson alone is worth bookmarking.
+  </Card>
+
+  <Card title="Portable Skills" icon="rocket">
+    FreeRTOS runs on STM32, ESP32, RP2040, and hundreds of other platforms. Zephyr adds Linux-like abstractions with devicetree. These skills transfer across every embedded job.
+  </Card>
+</CardGrid>
+
+## Course Structure
+
+Each lesson follows a consistent cycle:
+
+<Steps>
+1. **The Concurrency Problem**
+   A real scenario where bare-metal falls short. Multiple tasks that must coexist with timing guarantees.
+
+2. **RTOS Theory**
+   The kernel mechanism that solves this problem: how it works internally, its guarantees, and its costs.
+
+3. **FreeRTOS Implementation**
+   Build the solution on real hardware. Write tasks, configure the kernel, and handle edge cases.
+
+4. **Test and Break It**
+   Deliberately create failure conditions (deadlock, priority inversion, stack overflow) to understand the theory viscerally.
+
+5. **Design Patterns**
+   Reusable patterns for production firmware. When to use each primitive, and when simpler solutions are better.
+</Steps>
+
+## Lessons
+
+<CardGrid>
+  <Card title="Lesson 1: Real-Time Systems Concepts" icon="star">
+    [Real-Time Systems Concepts](./real-time-systems-concepts). Define hard, soft, and firm real-time. Measure jitter in bare-metal loops vs RTOS tasks. Understand worst-case execution time, scheduling theory, and rate-monotonic analysis. Build a jitter measurement rig.
+    **Build:** Jitter measurement rig. **Hardware:** STM32 Blue Pill or ESP32 (from prior courses), LED.
+  </Card>
+
+  <Card title="Lesson 2: Tasks, Scheduling, and Context Switching" icon="document">
+    [Tasks, Scheduling, and Context Switching](./tasks-scheduling-context-switching). Explore task states, priority-based preemptive scheduling, time slicing, and the task control block. Understand stack allocation and context switch overhead. Build a priority-based traffic light controller.
+    **Build:** Traffic light controller. **Parts:** 3 LEDs (red, yellow, green), 2 push buttons.
+  </Card>
+
+  <Card title="Lesson 3: Queues and Inter-Task Communication" icon="document">
+    [Queues and Inter-Task Communication](./queues-inter-task-communication). Implement message queues, stream buffers, and event groups for passing data between tasks. Producer-consumer patterns, queue sizing, and blocking vs non-blocking sends. Build a sensor data pipeline with filtering.
+    **Build:** Sensor data pipeline. **Parts:** Potentiometer, SSD1306 OLED (reuse from prior courses).
+  </Card>
+
+  <Card title="Lesson 4: Semaphores, Mutexes, and Synchronization" icon="document">
+    [Semaphores, Mutexes, and Synchronization](./semaphores-mutexes-synchronization). Master binary and counting semaphores, mutexes with priority inheritance, and deadlock avoidance strategies. Build a multi-sensor I2C coordinator with mutex-protected bus access.
+    **Build:** Multi-sensor I2C coordinator. **Parts:** BME280 + one other I2C sensor (reuse from prior courses).
+  </Card>
+
+  <Card title="Lesson 5: Memory Management and Safety" icon="document">
+    [Memory Management and Safety](./memory-management-safety). Compare FreeRTOS heap allocation schemes (heap_1 through heap_5). Implement static allocation, memory pools, and stack watermarking. Explore MPU-based memory protection. Build a memory-safe command processor.
+    **Build:** Memory-safe command processor. **Parts:** Reuse existing.
+  </Card>
+
+  <Card title="Lesson 6: Software Timers and Interrupt Management" icon="document">
+    [Software Timers and Interrupt Management](./software-timers-interrupt-management). Configure software timers, deferred interrupt processing, and ISR-safe API calls. Understand critical sections, interrupt nesting, and the timer service task. Build a debounced multi-button input system.
+    **Build:** Debounced multi-button input system. **Parts:** 4 push buttons, LEDs.
+  </Card>
+
+  <Card title="Lesson 7: Debugging and Profiling RTOS Applications" icon="document">
+    [Debugging and Profiling RTOS Applications](./debugging-profiling-rtos-applications). Use Tracealyzer or SystemView to visualize task execution in real-time. Measure CPU load, detect stack overflows, find priority inversions, and profile queue throughput. Receive intentionally buggy RTOS firmware and diagnose every issue.
+    **Build:** RTOS bug hunt (deadlock, priority inversion, stack overflow). **Parts:** Reuse existing.
+  </Card>
+
+  <Card title="Lesson 8: Zephyr RTOS Introduction" icon="document">
+    [Zephyr RTOS Introduction](./zephyr-rtos-introduction). Set up the Zephyr build system with west. Learn devicetree, Kconfig, and Zephyr's threading model. Port the traffic light controller from Lesson 2 to Zephyr and compare the two RTOS approaches.
+    **Build:** Traffic light controller on Zephyr. **Parts:** Same as Lesson 2.
+  </Card>
+</CardGrid>
+
+## Hardware
+
+**No new purchases needed.** This course uses hardware from the [ATmega328P](/education/embedded-programming-atmega328p/), [STM32](/education/embedded-programming-stm32/), or [ESP32](/education/embedded-programming-esp32/) courses:
+
+| Part | Source | Used In |
+|------|--------|---------|
+| STM32 Blue Pill + ST-Link (or ESP32 DevKitC) | STM32 or ESP32 course | All lessons |
+| LEDs (red, yellow, green) + resistors | ATmega328P course | Lessons 1, 2, 6, 8 |
+| Push buttons + 10K resistors | ATmega328P course | Lessons 2, 6, 8 |
+| Potentiometer | STM32 course | Lesson 3 |
+| SSD1306 OLED display | ATmega328P or STM32 course | Lesson 3 |
+| BME280 sensor | ATmega328P or STM32 course | Lesson 4 |
+
+**If you have completed any of the previous embedded courses, you already have everything.**
+
+## Skill Progression
+
+| Skill | Lessons 1-2 | Lessons 3-4 | Lessons 5-6 | Lessons 7-8 |
+|-------|------------|------------|------------|------------|
+| **Kernel** | Scheduler, task states, preemption | Queues, semaphores, mutexes | Heap schemes, timers, ISR integration | Trace tools, Zephyr kernel |
+| **Patterns** | Task decomposition, priority assignment | Producer-consumer, resource sharing | Static allocation, deferred processing | Profiling, cross-RTOS portability |
+| **Debugging** | Jitter measurement | Queue overflow detection | Stack watermarking, MPU faults | Tracealyzer, SystemView |
+| **Failure Modes** | Missed deadlines, starvation | Deadlock, priority inversion | Heap fragmentation, stack overflow | All combined in bug hunt |
+
+## Prerequisites
+
+<Badge text="Complete at least one prior embedded course" variant="caution" />
+
+**You should be comfortable with:**
+- Embedded C programming (registers, interrupts, peripheral drivers)
+- At least one microcontroller platform (STM32 recommended, ESP32 also works)
+- Our [Embedded Programming: STM32](/education/embedded-programming-stm32/) or [Embedded Programming: ESP32](/education/embedded-programming-esp32/) course
+
+**Helpful but not required:**
+- FreeRTOS basics from STM32 lesson 8 (this course goes much deeper)
+- Basic understanding of operating system concepts (processes, threads, scheduling)
+
+## Getting Started
+
+<Steps>
+1. **Use your STM32 Blue Pill or ESP32 DevKitC** from a previous course. Both run FreeRTOS.
+
+2. **Gather LEDs, buttons, and sensors** from your existing parts kit. No new purchases needed.
+
+3. **Install Tracealyzer** (free trial) or SEGGER SystemView (free) for lesson 7. Optional for earlier lessons.
+
+4. **Start with Lesson 1.** The jitter measurement rig gives you an immediate, visceral understanding of why RTOS matters.
+
+5. **Break things deliberately.** Each lesson includes a section where you intentionally create failure conditions. This is where the deepest learning happens.
+</Steps>
+
+:::tip[Which platform?]
+All lessons work on both STM32 and ESP32. Code examples are provided for FreeRTOS on STM32 as the primary platform, with ESP-IDF FreeRTOS notes where the API differs. Use whichever board you have.
+:::
+
+<Copyright />
+
+<TawkWidget />
