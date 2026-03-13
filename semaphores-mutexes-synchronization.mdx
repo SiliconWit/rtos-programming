@@ -1,0 +1,1299 @@
+---
+title: "Semaphores, Mutexes, and Synchronization"
+description: "Build a multi-sensor I2C coordinator where three sensor tasks share one I2C bus using mutex-protected access. Learn binary and counting semaphores, priority inheritance, deadlock avoidance, and priority inversion with practical demonstrations."
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-02-14
+tags: ["rtos", "freertos", "semaphores", "mutexes", "synchronization", "deadlock", "priority-inversion"]
+excerpt: "Coordinate three sensor tasks sharing a single I2C bus through FreeRTOS mutexes with priority inheritance. Deliberately trigger priority inversion and deadlock scenarios, then fix them using proper synchronization techniques."
+heroImage: "https://cdn.siliconwit.com/education/rtos-programming/Real-Time-Operating-System-RTOS.jpeg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import RtosProgrammingComments from '../../../../components/rtos-programming/RtosProgrammingComments.astro';
+
+When two tasks try to read from the same I2C bus at the same time, data gets corrupted. When three tasks share that bus at different priorities, you can get priority inversion where the highest-priority task waits behind the lowest. These are not theoretical problems; they crash real products and famously stalled the Mars Pathfinder rover. In this lesson you will wire up multiple I2C sensors, let their reading tasks collide without protection, observe the corruption, then fix it with mutexes that include priority inheritance. You will also deliberately create a deadlock and learn the patterns that prevent it. #FreeRTOS #Mutexes #Synchronization
+
+## What We Are Building
+
+<Card title="Multi-Sensor I2C Coordinator" icon="star">
+Three FreeRTOS tasks each read from a different I2C sensor (temperature, humidity, pressure from a BME280, plus a second I2C sensor). All sensors share one I2C bus. A mutex protects bus access, and priority inheritance prevents inversion. A demo mode lets you deliberately trigger deadlock and priority inversion so you can see them happen and understand the fixes.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| MCU | STM32 Blue Pill or ESP32 DevKit |
+| RTOS | FreeRTOS |
+| Sensor tasks | 3 (each reading a different measurement) |
+| Shared resource | I2C1 bus |
+| Protection | Mutex with priority inheritance |
+| Sensors | BME280 (temp/humidity/pressure) + 1 additional I2C sensor |
+| Demo modes | Normal operation, forced priority inversion, forced deadlock |
+| Task priorities | Low (1), Medium (2), High (3) |
+
+### Parts List
+
+| Ref | Component | Quantity | Notes |
+|-----|-----------|----------|-------|
+| U1 | STM32 Blue Pill or ESP32 DevKit | 1 | Reuse from prior courses |
+| U2 | BME280 breakout (I2C) | 1 | Temperature, humidity, pressure |
+| U3 | Additional I2C sensor (e.g., BH1750, MPU6050) | 1 | Reuse from prior courses |
+| - | Breadboard and jumper wires | 1 set | For prototyping |
+
+## The I2C Bus Collision Problem
+
+<InArticleAd />
+
+
+I2C is a shared bus. Only one master transaction can use the SDA and SCL lines at a time. When two FreeRTOS tasks both initiate I2C reads without coordination, the following sequence occurs:
+
+<Steps>
+1. **Task A begins an I2C read.** It sends a START condition, clocks out the slave address byte (0x76 for BME280), and begins receiving the first data byte.
+
+2. **The scheduler preempts Task A.** A higher-priority task becomes ready, or the time slice expires. Task A is suspended mid-transaction. The I2C peripheral is partway through a multi-byte read. SDA and SCL are in an undefined state from the bus protocol's perspective.
+
+3. **Task B starts its own I2C read.** It calls the I2C driver, which sends a new START condition on the same bus. The slave device that was mid-response to Task A sees an unexpected START. Depending on the slave's state machine, it may release SDA, hold it low, or ignore the new address entirely.
+
+4. **Data corruption occurs.** Task B reads bytes that are a mix of its own response and leftover bits from Task A's interrupted transaction. Task A, when it resumes, tries to continue clocking data from a slave that has already reset or moved to a different register. Both tasks get garbage values.
+</Steps>
+
+This is not a rare edge case. With three tasks reading at different rates (500 ms, 1000 ms, 2000 ms), collisions happen within seconds. The symptoms are intermittent: sometimes the temperature reads as -40 C, sometimes the humidity jumps to 255%, sometimes the I2C bus locks up entirely and requires a power cycle.
+
+The solution is to ensure only one task accesses the I2C bus at a time. FreeRTOS provides several synchronization primitives for this, each suited to different situations.
+
+## Binary Semaphores
+
+<InArticleAd />
+
+
+A binary semaphore is the simplest synchronization primitive. It has two states: available (1) or unavailable (0). Unlike a mutex, it has no concept of ownership; any task can give it and any task can take it.
+
+### API Overview
+
+```c
+/* Create a binary semaphore (starts empty / unavailable) */
+SemaphoreHandle_t xSemaphore = xSemaphoreCreateBinary();
+
+/* Give (signal) the semaphore: sets it to available */
+xSemaphoreGive(xSemaphore);
+
+/* Take (wait for) the semaphore: blocks until available */
+xSemaphoreTake(xSemaphore, portMAX_DELAY);
+
+/* Take with timeout: returns pdFALSE if timeout expires */
+BaseType_t result = xSemaphoreTake(xSemaphore, pdMS_TO_TICKS(100));
+```
+
+### When to Use Binary Semaphores
+
+Binary semaphores are best for **signaling** between tasks or from an ISR to a task. They are not ideal for protecting shared resources because they lack ownership tracking.
+
+The classic use case is ISR-to-task notification:
+
+```c
+/* ISR: data is ready, wake the processing task */
+void EXTI0_IRQHandler(void)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    /* Clear the interrupt flag */
+    EXTI->PR |= EXTI_PR_PR0;
+
+    /* Signal the waiting task */
+    xSemaphoreGiveFromISR(xSemaphore, &xHigherPriorityTaskWoken);
+
+    /* Request a context switch if the woken task has higher priority */
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+/* Task: blocks until the ISR signals */
+void vDataProcessingTask(void *pvParameters)
+{
+    for (;;)
+    {
+        /* Block indefinitely until ISR gives the semaphore */
+        xSemaphoreTake(xSemaphore, portMAX_DELAY);
+
+        /* ISR fired, process the data */
+        process_sensor_data();
+    }
+}
+```
+
+Notice `xSemaphoreGiveFromISR` instead of `xSemaphoreGive`. All FreeRTOS API calls from within an ISR must use the `FromISR` variant, which never blocks and accepts the `xHigherPriorityTaskWoken` parameter for deferred context switching.
+
+:::caution[Binary Semaphore Pitfall]
+A binary semaphore created with `xSemaphoreCreateBinary()` starts in the **empty** state. You must call `xSemaphoreGive()` once before any task can successfully take it, unless you want the first `xSemaphoreTake()` to block until some other task or ISR gives it.
+:::
+
+## Counting Semaphores
+
+<InArticleAd />
+
+
+A counting semaphore extends the binary concept by maintaining a count that can be greater than one. Each `Give` increments the count (up to a maximum), and each `Take` decrements it (blocking if the count is zero).
+
+### API Overview
+
+```c
+/* Create a counting semaphore
+ * uxMaxCount:     maximum count value
+ * uxInitialCount: starting count value
+ */
+SemaphoreHandle_t xCountSem = xSemaphoreCreateCounting(5, 0);
+
+/* Give: increments count (up to max) */
+xSemaphoreGive(xCountSem);  /* count goes from 0 to 1 */
+xSemaphoreGive(xCountSem);  /* count goes from 1 to 2 */
+
+/* Take: decrements count (blocks if count is 0) */
+xSemaphoreTake(xCountSem, portMAX_DELAY);  /* count goes from 2 to 1 */
+```
+
+### Practical Use: Buffer Pool Management
+
+Suppose you have a pool of five DMA buffers for I2C transfers. A counting semaphore tracks how many buffers are free:
+
+```c
+#define BUFFER_POOL_SIZE 5
+
+static SemaphoreHandle_t xBufferCountSem;
+static uint8_t ucBufferPool[BUFFER_POOL_SIZE][64];
+static uint8_t ucBufferInUse[BUFFER_POOL_SIZE];
+
+void vInitBufferPool(void)
+{
+    /* All 5 buffers start as available */
+    xBufferCountSem = xSemaphoreCreateCounting(BUFFER_POOL_SIZE, BUFFER_POOL_SIZE);
+
+    for (int i = 0; i < BUFFER_POOL_SIZE; i++)
+        ucBufferInUse[i] = 0;
+}
+
+uint8_t *pucAllocateBuffer(TickType_t xTimeout)
+{
+    /* Block until a buffer is available */
+    if (xSemaphoreTake(xBufferCountSem, xTimeout) == pdTRUE)
+    {
+        for (int i = 0; i < BUFFER_POOL_SIZE; i++)
+        {
+            if (ucBufferInUse[i] == 0)
+            {
+                ucBufferInUse[i] = 1;
+                return ucBufferPool[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+void vReleaseBuffer(uint8_t *pucBuffer)
+{
+    int index = (pucBuffer - &ucBufferPool[0][0]) / 64;
+    ucBufferInUse[index] = 0;
+    xSemaphoreGive(xBufferCountSem);
+}
+```
+
+When a task calls `pucAllocateBuffer`, the counting semaphore blocks it if all five buffers are in use. When another task releases a buffer, the semaphore count increments and the blocked task wakes up.
+
+## Mutexes
+
+<InArticleAd />
+
+
+A mutex (mutual exclusion) looks like a binary semaphore but adds one critical property: **ownership**. Only the task that took the mutex can give it back. This ownership tracking enables priority inheritance, which prevents a class of bugs that binary semaphores cannot.
+
+### API Overview
+
+```c
+/* Create a mutex (starts in the available state, unlike binary semaphores) */
+SemaphoreHandle_t xMutex = xSemaphoreCreateMutex();
+
+/* Acquire the mutex (blocks if another task holds it) */
+xSemaphoreTake(xMutex, portMAX_DELAY);
+
+/* Access the shared resource safely */
+i2c_read(BME280_ADDR, data, len);
+
+/* Release the mutex (only the owning task can do this) */
+xSemaphoreGive(xMutex);
+```
+
+### Mutex vs. Binary Semaphore
+
+| Property | Binary Semaphore | Mutex |
+|----------|-----------------|-------|
+| Initial state | Empty (0) | Available (1) |
+| Ownership | None; any task can give | Yes; only the holder can give |
+| Priority inheritance | No | Yes |
+| Use case | Signaling, ISR-to-task | Protecting shared resources |
+| Can be used from ISR | Yes (FromISR variants) | No (ownership requires task context) |
+
+The key rule: **use semaphores for signaling, use mutexes for resource protection.** If you protect an I2C bus with a binary semaphore instead of a mutex, you lose priority inheritance. That means priority inversion can freeze your highest-priority task for an unbounded amount of time.
+
+:::note[Mutex Creation Memory]
+`xSemaphoreCreateMutex()` allocates the mutex control block from the FreeRTOS heap. If you want static allocation (no heap), use `xSemaphoreCreateMutexStatic()` and provide your own `StaticSemaphore_t` buffer.
+:::
+
+## Priority Inheritance and the Mars Pathfinder Problem
+
+<InArticleAd />
+
+
+On July 4, 1997, the Mars Pathfinder rover landed successfully but began experiencing repeated system resets. The root cause was priority inversion: a classic real-time systems bug that this section will make concrete.
+
+### The Setup
+
+Consider three tasks:
+
+| Task | Priority | Role |
+|------|----------|------|
+| vTempTask | High (3) | Reads temperature every 500 ms |
+| vHumidityTask | Medium (2) | Reads humidity every 1000 ms |
+| vPressureTask | Low (1) | Reads pressure every 2000 ms |
+
+All three share one I2C bus protected by a mutex.
+
+### The Inversion Sequence
+
+<Steps>
+1. **vPressureTask (low priority) acquires the I2C mutex** and begins a pressure reading. This takes several milliseconds because the BME280 requires a conversion command, a wait, and a multi-byte read.
+
+2. **vTempTask (high priority) wakes up** because 500 ms have elapsed. It tries to acquire the I2C mutex but cannot, since vPressureTask holds it. vTempTask blocks.
+
+3. **vHumidityTask (medium priority) wakes up.** It does not need the I2C mutex yet (perhaps it is doing calculations). Because it has higher priority than vPressureTask, it preempts the low-priority task.
+
+4. **vPressureTask cannot run.** It still holds the mutex, but vHumidityTask is consuming all the CPU time. vTempTask, the highest-priority task, remains blocked because the mutex is still held.
+
+5. **The high-priority task waits behind the medium-priority task.** This is priority inversion. The effective priority ordering has been reversed. If vHumidityTask runs for a long time, vTempTask misses its 500 ms deadline.
+</Steps>
+
+On the Mars Pathfinder, this scenario caused a watchdog timer to fire, resetting the computer and losing scientific data.
+
+### Priority Inheritance: The Fix
+
+FreeRTOS mutexes implement priority inheritance automatically. When a high-priority task blocks on a mutex held by a low-priority task, the scheduler **temporarily raises** the holder's priority to match the blocked task. Here is the corrected sequence:
+
+<Steps>
+1. **vPressureTask (priority 1) acquires the mutex** and starts reading.
+
+2. **vTempTask (priority 3) tries to take the mutex.** The scheduler sees that vPressureTask holds it and immediately boosts vPressureTask's priority from 1 to 3.
+
+3. **vHumidityTask (priority 2) wakes up.** It cannot preempt vPressureTask because vPressureTask is now running at priority 3.
+
+4. **vPressureTask finishes its I2C read and releases the mutex.** Its priority drops back to 1. The mutex is given to vTempTask, which has been waiting.
+
+5. **vTempTask runs immediately** at priority 3, reads the temperature, and releases the mutex. Normal priority ordering is restored.
+</Steps>
+
+The total delay for vTempTask is limited to the remaining time vPressureTask needed to finish its I2C transaction. Without priority inheritance, the delay could be unbounded.
+
+## Deadlock
+
+<InArticleAd />
+
+
+Deadlock occurs when two or more tasks are each waiting for a resource held by the other, creating a circular dependency that can never resolve.
+
+### The Sequence
+
+Suppose you have two shared resources (I2C bus and a display) each protected by its own mutex:
+
+```c
+SemaphoreHandle_t xI2CMutex;
+SemaphoreHandle_t xDisplayMutex;
+```
+
+Two tasks acquire them in opposite order:
+
+| Time | Task A (reads sensor, updates display) | Task B (reads display status, triggers I2C) |
+|------|---------------------------------------|---------------------------------------------|
+| t0 | Takes xI2CMutex (success) | Takes xDisplayMutex (success) |
+| t1 | Tries to take xDisplayMutex (blocks) | Tries to take xI2CMutex (blocks) |
+| t2 | Waiting for Task B... | Waiting for Task A... |
+| t3 | **Deadlocked forever** | **Deadlocked forever** |
+
+Neither task can proceed. No amount of waiting will resolve this. The system appears frozen: serial output stops, sensors stop updating, and the watchdog (if configured) eventually resets the board.
+
+### Prevention Strategies
+
+**1. Consistent lock ordering.** If every task always acquires xI2CMutex before xDisplayMutex, the circular dependency cannot form. This is the simplest and most reliable prevention method.
+
+**2. Use timeouts instead of portMAX_DELAY.** If a task cannot acquire a mutex within a reasonable time, it releases any mutexes it already holds and retries:
+
+```c
+if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(200)) == pdTRUE)
+{
+    if (xSemaphoreTake(xDisplayMutex, pdMS_TO_TICKS(200)) == pdTRUE)
+    {
+        /* Both acquired, do work */
+        xSemaphoreGive(xDisplayMutex);
+    }
+    else
+    {
+        /* Timeout: release I2C mutex and retry later */
+        printf("Display mutex timeout, releasing I2C mutex\r\n");
+    }
+    xSemaphoreGive(xI2CMutex);
+}
+```
+
+**3. Minimize lock scope.** Hold the mutex for the shortest possible time. Read the sensor data under the mutex, but do processing and formatting after releasing it. The less time you hold a lock, the smaller the window for contention.
+
+**4. Use a single mutex when possible.** If both resources are always used together, protect them with one mutex instead of two. No second lock means no circular dependency.
+
+## Circuit Connections
+
+<InArticleAd />
+
+
+Both the BME280 and the second I2C sensor share the same I2C bus (I2C1 on STM32, Wire on ESP32). The bus requires pull-up resistors on SDA and SCL. Most breakout boards include these on-board, but if you are using bare modules, add 4.7k resistors from each line to 3.3V.
+
+<Tabs>
+<TabItem label="STM32 Blue Pill">
+
+| Signal | STM32 Pin | BME280 Pin | Second Sensor Pin |
+|--------|-----------|------------|-------------------|
+| SDA | PB7 (I2C1_SDA) | SDA | SDA |
+| SCL | PB6 (I2C1_SCL) | SCL | SCL |
+| VCC | 3.3V | VIN/3V3 | VIN/3V3 |
+| GND | GND | GND | GND |
+
+The BME280 default I2C address is 0x76 (SDO pin low) or 0x77 (SDO pin high). If your second sensor (e.g., BH1750 at 0x23 or MPU6050 at 0x68) shares the same address as the BME280, you must change one of them by pulling the address pin high or low.
+
+Connect the ST-Link for programming and USART1 (PA9 TX, PA10 RX) for serial output at 115200 baud.
+
+</TabItem>
+<TabItem label="ESP32 DevKit">
+
+| Signal | ESP32 Pin | BME280 Pin | Second Sensor Pin |
+|--------|-----------|------------|-------------------|
+| SDA | GPIO 21 | SDA | SDA |
+| SCL | GPIO 22 | SCL | SCL |
+| VCC | 3.3V | VIN/3V3 | VIN/3V3 |
+| GND | GND | GND | GND |
+
+The ESP32's default I2C pins are GPIO 21 (SDA) and GPIO 22 (SCL). Serial output goes through the USB connection at 115200 baud.
+
+</TabItem>
+</Tabs>
+
+## Complete Multi-Sensor Coordinator
+
+<InArticleAd />
+
+
+This program creates three tasks at different priorities, all sharing one I2C bus through a mutex. A `DEMO_MODE` constant selects between normal operation, forced priority inversion, and forced deadlock.
+
+<Tabs>
+<TabItem label="STM32 (FreeRTOS)">
+
+```c
+/* main.c - Multi-Sensor I2C Coordinator with Mutex Protection
+ * Target: STM32F103C8T6 (Blue Pill) with FreeRTOS
+ * Sensors: BME280 on I2C1 (address 0x76)
+ */
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include "stm32f1xx_hal.h"
+#include <stdio.h>
+#include <string.h>
+
+/* Demo mode selection:
+ *   0 = Normal operation (mutex with priority inheritance)
+ *   1 = Priority inversion demo (binary semaphore, no inheritance)
+ *   2 = Deadlock demo (two mutexes, wrong order)
+ */
+#define DEMO_MODE 0
+
+/* BME280 register addresses */
+#define BME280_ADDR         0x76
+#define BME280_REG_TEMP     0xFA
+#define BME280_REG_HUM      0xFD
+#define BME280_REG_PRESS    0xF7
+#define BME280_REG_CTRL_HUM 0xF2
+#define BME280_REG_CTRL_MEAS 0xF4
+
+/* I2C handle */
+static I2C_HandleTypeDef hi2c1;
+
+/* Synchronization primitives */
+static SemaphoreHandle_t xI2CMutex;
+
+#if DEMO_MODE == 1
+static SemaphoreHandle_t xI2CBinarySem;  /* No priority inheritance */
+#endif
+
+#if DEMO_MODE == 2
+static SemaphoreHandle_t xDisplayMutex;  /* Second mutex for deadlock demo */
+#endif
+
+/* Shared sensor data (protected by mutex in normal mode) */
+static volatile float fTemperature = 0.0f;
+static volatile float fHumidity    = 0.0f;
+static volatile float fPressure    = 0.0f;
+
+/* Task handles */
+static TaskHandle_t xTempTaskHandle;
+static TaskHandle_t xHumidityTaskHandle;
+static TaskHandle_t xPressureTaskHandle;
+
+/* Forward declarations */
+static void SystemClock_Config(void);
+static void I2C1_Init(void);
+static void USART1_Init(void);
+static void BME280_Init(void);
+static int32_t BME280_ReadRaw(uint8_t reg, uint8_t *buf, uint8_t len);
+
+/* Retarget printf to USART1 */
+extern UART_HandleTypeDef huart1;
+int _write(int file, char *ptr, int len)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, HAL_MAX_DELAY);
+    return len;
+}
+
+/*-----------------------------------------------------------
+ * Helper: read raw bytes from BME280 over I2C
+ *-----------------------------------------------------------*/
+static int32_t BME280_ReadRaw(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+    HAL_StatusTypeDef status;
+    status = HAL_I2C_Mem_Read(&hi2c1, BME280_ADDR << 1, reg,
+                               I2C_MEMADD_SIZE_8BIT, buf, len, 100);
+    return (status == HAL_OK) ? 0 : -1;
+}
+
+/*-----------------------------------------------------------
+ * Temperature Task (Priority 3, highest)
+ * Reads BME280 temperature every 500 ms
+ *-----------------------------------------------------------*/
+static void vTempTask(void *pvParameters)
+{
+    uint8_t buf[3];
+    TickType_t xLastWake = xTaskGetTickCount();
+    SemaphoreHandle_t xLock;
+
+#if DEMO_MODE == 1
+    xLock = xI2CBinarySem;
+#else
+    xLock = xI2CMutex;
+#endif
+
+    for (;;)
+    {
+        printf("[TEMP  ] Waiting for I2C mutex (tick %lu)\r\n",
+               (unsigned long)xTaskGetTickCount());
+
+#if DEMO_MODE == 2
+        /* Deadlock demo: acquire I2C first, then Display */
+        if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
+        {
+            printf("[TEMP  ] Acquired I2C mutex, now taking Display mutex...\r\n");
+            vTaskDelay(pdMS_TO_TICKS(10)); /* Small delay to ensure overlap */
+
+            if (xSemaphoreTake(xDisplayMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
+            {
+                BME280_ReadRaw(BME280_REG_TEMP, buf, 3);
+                int32_t raw = ((int32_t)buf[0] << 12) |
+                              ((int32_t)buf[1] << 4)  |
+                              ((int32_t)buf[2] >> 4);
+                fTemperature = (float)raw / 5120.0f;
+                printf("[TEMP  ] %.1f C\r\n", fTemperature);
+                xSemaphoreGive(xDisplayMutex);
+            }
+            else
+            {
+                printf("[TEMP  ] TIMEOUT waiting for Display mutex! Possible deadlock.\r\n");
+            }
+            xSemaphoreGive(xI2CMutex);
+        }
+#else
+        /* Normal mode and priority inversion demo */
+        if (xSemaphoreTake(xLock, portMAX_DELAY) == pdTRUE)
+        {
+            printf("[TEMP  ] Acquired I2C mutex (tick %lu)\r\n",
+                   (unsigned long)xTaskGetTickCount());
+
+            BME280_ReadRaw(BME280_REG_TEMP, buf, 3);
+            int32_t raw = ((int32_t)buf[0] << 12) |
+                          ((int32_t)buf[1] << 4)  |
+                          ((int32_t)buf[2] >> 4);
+            fTemperature = (float)raw / 5120.0f;
+
+            printf("[TEMP  ] %.1f C, releasing mutex (tick %lu)\r\n",
+                   fTemperature, (unsigned long)xTaskGetTickCount());
+            xSemaphoreGive(xLock);
+        }
+#endif
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(500));
+    }
+}
+
+/*-----------------------------------------------------------
+ * Humidity Task (Priority 2, medium)
+ * Reads BME280 humidity every 1000 ms
+ *-----------------------------------------------------------*/
+static void vHumidityTask(void *pvParameters)
+{
+    uint8_t buf[2];
+    TickType_t xLastWake = xTaskGetTickCount();
+    SemaphoreHandle_t xLock;
+
+#if DEMO_MODE == 1
+    xLock = xI2CBinarySem;
+#else
+    xLock = xI2CMutex;
+#endif
+
+    for (;;)
+    {
+        printf("[HUMID ] Waiting for I2C mutex (tick %lu)\r\n",
+               (unsigned long)xTaskGetTickCount());
+
+#if DEMO_MODE == 2
+        /* Deadlock demo: acquire Display first, then I2C (opposite order) */
+        if (xSemaphoreTake(xDisplayMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
+        {
+            printf("[HUMID ] Acquired Display mutex, now taking I2C mutex...\r\n");
+            vTaskDelay(pdMS_TO_TICKS(10));
+
+            if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
+            {
+                BME280_ReadRaw(BME280_REG_HUM, buf, 2);
+                int32_t raw = ((int32_t)buf[0] << 8) | (int32_t)buf[1];
+                fHumidity = (float)raw / 1024.0f;
+                printf("[HUMID ] %.1f %%\r\n", fHumidity);
+                xSemaphoreGive(xI2CMutex);
+            }
+            else
+            {
+                printf("[HUMID ] TIMEOUT waiting for I2C mutex! Possible deadlock.\r\n");
+            }
+            xSemaphoreGive(xDisplayMutex);
+        }
+#else
+        if (xSemaphoreTake(xLock, portMAX_DELAY) == pdTRUE)
+        {
+            printf("[HUMID ] Acquired I2C mutex (tick %lu)\r\n",
+                   (unsigned long)xTaskGetTickCount());
+
+            BME280_ReadRaw(BME280_REG_HUM, buf, 2);
+            int32_t raw = ((int32_t)buf[0] << 8) | (int32_t)buf[1];
+            fHumidity = (float)raw / 1024.0f;
+
+#if DEMO_MODE == 1
+            /* Simulate heavy computation to trigger priority inversion.
+             * While this medium-priority task runs, the low-priority task
+             * holding the semaphore cannot finish, and the high-priority
+             * task stays blocked.
+             */
+            printf("[HUMID ] Starting heavy computation...\r\n");
+            volatile uint32_t count = 0;
+            for (uint32_t i = 0; i < 2000000; i++)
+                count += i;
+            printf("[HUMID ] Computation done (tick %lu)\r\n",
+                   (unsigned long)xTaskGetTickCount());
+#endif
+
+            printf("[HUMID ] %.1f %%, releasing mutex (tick %lu)\r\n",
+                   fHumidity, (unsigned long)xTaskGetTickCount());
+            xSemaphoreGive(xLock);
+        }
+#endif
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(1000));
+    }
+}
+
+/*-----------------------------------------------------------
+ * Pressure Task (Priority 1, lowest)
+ * Reads BME280 pressure every 2000 ms
+ *-----------------------------------------------------------*/
+static void vPressureTask(void *pvParameters)
+{
+    uint8_t buf[3];
+    TickType_t xLastWake = xTaskGetTickCount();
+    SemaphoreHandle_t xLock;
+
+#if DEMO_MODE == 1
+    xLock = xI2CBinarySem;
+#else
+    xLock = xI2CMutex;
+#endif
+
+    for (;;)
+    {
+        printf("[PRESS ] Waiting for I2C mutex (tick %lu)\r\n",
+               (unsigned long)xTaskGetTickCount());
+
+        if (xSemaphoreTake(xLock, portMAX_DELAY) == pdTRUE)
+        {
+            printf("[PRESS ] Acquired I2C mutex (tick %lu)\r\n",
+                   (unsigned long)xTaskGetTickCount());
+
+            BME280_ReadRaw(BME280_REG_PRESS, buf, 3);
+            int32_t raw = ((int32_t)buf[0] << 12) |
+                          ((int32_t)buf[1] << 4)  |
+                          ((int32_t)buf[2] >> 4);
+            fPressure = (float)raw / 25600.0f;
+
+#if DEMO_MODE == 1
+            /* Hold the lock for a long time to create the
+             * inversion window. With a real mutex, priority
+             * inheritance would boost this task. With a binary
+             * semaphore, the medium-priority task can preempt
+             * and block the high-priority task indirectly.
+             */
+            printf("[PRESS ] Holding lock during slow read...\r\n");
+            HAL_Delay(50);  /* Simulate slow I2C transaction */
+#endif
+
+            printf("[PRESS ] %.1f hPa, releasing mutex (tick %lu)\r\n",
+                   fPressure, (unsigned long)xTaskGetTickCount());
+            xSemaphoreGive(xLock);
+        }
+
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(2000));
+    }
+}
+
+/*-----------------------------------------------------------
+ * BME280 initialization
+ *-----------------------------------------------------------*/
+static void BME280_Init(void)
+{
+    uint8_t val;
+
+    /* Set humidity oversampling x1 */
+    val = 0x01;
+    HAL_I2C_Mem_Write(&hi2c1, BME280_ADDR << 1, BME280_REG_CTRL_HUM,
+                      I2C_MEMADD_SIZE_8BIT, &val, 1, 100);
+
+    /* Set temp and pressure oversampling x1, normal mode */
+    val = 0x27;  /* osrs_t=001, osrs_p=001, mode=11 */
+    HAL_I2C_Mem_Write(&hi2c1, BME280_ADDR << 1, BME280_REG_CTRL_MEAS,
+                      I2C_MEMADD_SIZE_8BIT, &val, 1, 100);
+}
+
+/*-----------------------------------------------------------
+ * Peripheral initialization (abbreviated, see project files
+ * for full SystemClock_Config and I2C1_Init)
+ *-----------------------------------------------------------*/
+UART_HandleTypeDef huart1;
+
+static void USART1_Init(void)
+{
+    __HAL_RCC_USART1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin   = GPIO_PIN_9;
+    gpio.Mode  = GPIO_MODE_AF_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    gpio.Pin  = GPIO_PIN_10;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    huart1.Instance          = USART1;
+    huart1.Init.BaudRate     = 115200;
+    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits     = UART_STOPBITS_1;
+    huart1.Init.Parity       = UART_PARITY_NONE;
+    huart1.Init.Mode         = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    HAL_UART_Init(&huart1);
+}
+
+static void I2C1_Init(void)
+{
+    __HAL_RCC_I2C1_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+    gpio.Mode  = GPIO_MODE_AF_OD;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    hi2c1.Instance             = I2C1;
+    hi2c1.Init.ClockSpeed      = 100000;
+    hi2c1.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1     = 0;
+    hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+    HAL_I2C_Init(&hi2c1);
+}
+
+static void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    osc.HSEState       = RCC_HSE_ON;
+    osc.PLL.PLLState   = RCC_PLL_ON;
+    osc.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    osc.PLL.PLLMUL     = RCC_PLL_MUL9;
+    HAL_RCC_OscConfig(&osc);
+
+    RCC_ClkInitTypeDef clk = {0};
+    clk.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                          RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV2;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2);
+}
+
+/*-----------------------------------------------------------
+ * Main
+ *-----------------------------------------------------------*/
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    USART1_Init();
+    I2C1_Init();
+    BME280_Init();
+
+    printf("\r\n=== Multi-Sensor I2C Coordinator ===\r\n");
+
+#if DEMO_MODE == 0
+    printf("Mode: Normal (mutex with priority inheritance)\r\n\r\n");
+    xI2CMutex = xSemaphoreCreateMutex();
+    configASSERT(xI2CMutex != NULL);
+#elif DEMO_MODE == 1
+    printf("Mode: Priority Inversion Demo (binary semaphore, no inheritance)\r\n\r\n");
+    xI2CBinarySem = xSemaphoreCreateBinary();
+    xSemaphoreGive(xI2CBinarySem);  /* Start available */
+    xI2CMutex = xSemaphoreCreateMutex();  /* Unused but keeps code simple */
+    configASSERT(xI2CBinarySem != NULL);
+#elif DEMO_MODE == 2
+    printf("Mode: Deadlock Demo (two mutexes, opposite acquisition order)\r\n\r\n");
+    xI2CMutex     = xSemaphoreCreateMutex();
+    xDisplayMutex = xSemaphoreCreateMutex();
+    configASSERT(xI2CMutex != NULL);
+    configASSERT(xDisplayMutex != NULL);
+#endif
+
+    xTaskCreate(vTempTask,     "Temp",     256, NULL, 3, &xTempTaskHandle);
+    xTaskCreate(vHumidityTask, "Humidity", 256, NULL, 2, &xHumidityTaskHandle);
+    xTaskCreate(vPressureTask, "Pressure", 256, NULL, 1, &xPressureTaskHandle);
+
+    printf("Starting scheduler...\r\n\r\n");
+    vTaskStartScheduler();
+
+    /* Should never reach here */
+    for (;;) {}
+}
+```
+
+</TabItem>
+<TabItem label="ESP32 (FreeRTOS)">
+
+```c
+/* main.c - Multi-Sensor I2C Coordinator with Mutex Protection
+ * Target: ESP32 DevKit with ESP-IDF FreeRTOS
+ * Sensors: BME280 on I2C (address 0x76)
+ */
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include <string.h>
+
+static const char *TAG = "I2C_COORD";
+
+/* Demo mode: 0=normal, 1=priority inversion, 2=deadlock */
+#define DEMO_MODE 0
+
+#define BME280_ADDR         0x76
+#define BME280_REG_TEMP     0xFA
+#define BME280_REG_HUM      0xFD
+#define BME280_REG_PRESS    0xF7
+#define BME280_REG_CTRL_HUM 0xF2
+#define BME280_REG_CTRL_MEAS 0xF4
+
+#define I2C_MASTER_NUM      I2C_NUM_0
+#define I2C_SDA_PIN         21
+#define I2C_SCL_PIN         22
+#define I2C_FREQ_HZ         100000
+
+static SemaphoreHandle_t xI2CMutex;
+
+#if DEMO_MODE == 1
+static SemaphoreHandle_t xI2CBinarySem;
+#endif
+
+#if DEMO_MODE == 2
+static SemaphoreHandle_t xDisplayMutex;
+#endif
+
+static volatile float fTemperature = 0.0f;
+static volatile float fHumidity    = 0.0f;
+static volatile float fPressure    = 0.0f;
+
+/*-----------------------------------------------------------
+ * I2C initialization
+ *-----------------------------------------------------------*/
+static void i2c_master_init(void)
+{
+    i2c_config_t conf = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = I2C_SDA_PIN,
+        .scl_io_num       = I2C_SCL_PIN,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_FREQ_HZ,
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+}
+
+static esp_err_t bme280_read_raw(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+    return i2c_master_write_read_device(I2C_MASTER_NUM, BME280_ADDR,
+                                        &reg, 1, buf, len,
+                                        pdMS_TO_TICKS(100));
+}
+
+static void bme280_init(void)
+{
+    uint8_t cmd[2];
+    cmd[0] = BME280_REG_CTRL_HUM;
+    cmd[1] = 0x01;
+    i2c_master_write_to_device(I2C_MASTER_NUM, BME280_ADDR,
+                               cmd, 2, pdMS_TO_TICKS(100));
+
+    cmd[0] = BME280_REG_CTRL_MEAS;
+    cmd[1] = 0x27;
+    i2c_master_write_to_device(I2C_MASTER_NUM, BME280_ADDR,
+                               cmd, 2, pdMS_TO_TICKS(100));
+}
+
+/*-----------------------------------------------------------
+ * Temperature Task (Priority 3)
+ *-----------------------------------------------------------*/
+static void vTempTask(void *pvParameters)
+{
+    uint8_t buf[3];
+    TickType_t xLastWake = xTaskGetTickCount();
+    SemaphoreHandle_t xLock;
+
+#if DEMO_MODE == 1
+    xLock = xI2CBinarySem;
+#else
+    xLock = xI2CMutex;
+#endif
+
+    for (;;)
+    {
+        ESP_LOGI(TAG, "[TEMP  ] Waiting for I2C mutex (tick %lu)",
+                 (unsigned long)xTaskGetTickCount());
+
+#if DEMO_MODE == 2
+        if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
+        {
+            ESP_LOGI(TAG, "[TEMP  ] Acquired I2C, taking Display...");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (xSemaphoreTake(xDisplayMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
+            {
+                bme280_read_raw(BME280_REG_TEMP, buf, 3);
+                int32_t raw = ((int32_t)buf[0] << 12) |
+                              ((int32_t)buf[1] << 4)  |
+                              ((int32_t)buf[2] >> 4);
+                fTemperature = (float)raw / 5120.0f;
+                ESP_LOGI(TAG, "[TEMP  ] %.1f C", fTemperature);
+                xSemaphoreGive(xDisplayMutex);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "[TEMP  ] TIMEOUT on Display mutex! Deadlock?");
+            }
+            xSemaphoreGive(xI2CMutex);
+        }
+#else
+        if (xSemaphoreTake(xLock, portMAX_DELAY) == pdTRUE)
+        {
+            ESP_LOGI(TAG, "[TEMP  ] Acquired I2C mutex (tick %lu)",
+                     (unsigned long)xTaskGetTickCount());
+            bme280_read_raw(BME280_REG_TEMP, buf, 3);
+            int32_t raw = ((int32_t)buf[0] << 12) |
+                          ((int32_t)buf[1] << 4)  |
+                          ((int32_t)buf[2] >> 4);
+            fTemperature = (float)raw / 5120.0f;
+            ESP_LOGI(TAG, "[TEMP  ] %.1f C, releasing (tick %lu)",
+                     fTemperature, (unsigned long)xTaskGetTickCount());
+            xSemaphoreGive(xLock);
+        }
+#endif
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(500));
+    }
+}
+
+/*-----------------------------------------------------------
+ * Humidity Task (Priority 2)
+ *-----------------------------------------------------------*/
+static void vHumidityTask(void *pvParameters)
+{
+    uint8_t buf[2];
+    TickType_t xLastWake = xTaskGetTickCount();
+    SemaphoreHandle_t xLock;
+
+#if DEMO_MODE == 1
+    xLock = xI2CBinarySem;
+#else
+    xLock = xI2CMutex;
+#endif
+
+    for (;;)
+    {
+        ESP_LOGI(TAG, "[HUMID ] Waiting for I2C mutex (tick %lu)",
+                 (unsigned long)xTaskGetTickCount());
+
+#if DEMO_MODE == 2
+        if (xSemaphoreTake(xDisplayMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
+        {
+            ESP_LOGI(TAG, "[HUMID ] Acquired Display, taking I2C...");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (xSemaphoreTake(xI2CMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
+            {
+                bme280_read_raw(BME280_REG_HUM, buf, 2);
+                int32_t raw = ((int32_t)buf[0] << 8) | (int32_t)buf[1];
+                fHumidity = (float)raw / 1024.0f;
+                ESP_LOGI(TAG, "[HUMID ] %.1f %%", fHumidity);
+                xSemaphoreGive(xI2CMutex);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "[HUMID ] TIMEOUT on I2C mutex! Deadlock?");
+            }
+            xSemaphoreGive(xDisplayMutex);
+        }
+#else
+        if (xSemaphoreTake(xLock, portMAX_DELAY) == pdTRUE)
+        {
+            ESP_LOGI(TAG, "[HUMID ] Acquired I2C mutex (tick %lu)",
+                     (unsigned long)xTaskGetTickCount());
+            bme280_read_raw(BME280_REG_HUM, buf, 2);
+            int32_t raw = ((int32_t)buf[0] << 8) | (int32_t)buf[1];
+            fHumidity = (float)raw / 1024.0f;
+
+#if DEMO_MODE == 1
+            ESP_LOGI(TAG, "[HUMID ] Starting heavy computation...");
+            volatile uint32_t count = 0;
+            for (uint32_t i = 0; i < 2000000; i++)
+                count += i;
+            ESP_LOGI(TAG, "[HUMID ] Computation done (tick %lu)",
+                     (unsigned long)xTaskGetTickCount());
+#endif
+
+            ESP_LOGI(TAG, "[HUMID ] %.1f %%, releasing (tick %lu)",
+                     fHumidity, (unsigned long)xTaskGetTickCount());
+            xSemaphoreGive(xLock);
+        }
+#endif
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(1000));
+    }
+}
+
+/*-----------------------------------------------------------
+ * Pressure Task (Priority 1)
+ *-----------------------------------------------------------*/
+static void vPressureTask(void *pvParameters)
+{
+    uint8_t buf[3];
+    TickType_t xLastWake = xTaskGetTickCount();
+    SemaphoreHandle_t xLock;
+
+#if DEMO_MODE == 1
+    xLock = xI2CBinarySem;
+#else
+    xLock = xI2CMutex;
+#endif
+
+    for (;;)
+    {
+        ESP_LOGI(TAG, "[PRESS ] Waiting for I2C mutex (tick %lu)",
+                 (unsigned long)xTaskGetTickCount());
+
+        if (xSemaphoreTake(xLock, portMAX_DELAY) == pdTRUE)
+        {
+            ESP_LOGI(TAG, "[PRESS ] Acquired I2C mutex (tick %lu)",
+                     (unsigned long)xTaskGetTickCount());
+            bme280_read_raw(BME280_REG_PRESS, buf, 3);
+            int32_t raw = ((int32_t)buf[0] << 12) |
+                          ((int32_t)buf[1] << 4)  |
+                          ((int32_t)buf[2] >> 4);
+            fPressure = (float)raw / 25600.0f;
+
+#if DEMO_MODE == 1
+            ESP_LOGI(TAG, "[PRESS ] Holding lock during slow read...");
+            vTaskDelay(pdMS_TO_TICKS(50));
+#endif
+
+            ESP_LOGI(TAG, "[PRESS ] %.1f hPa, releasing (tick %lu)",
+                     fPressure, (unsigned long)xTaskGetTickCount());
+            xSemaphoreGive(xLock);
+        }
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(2000));
+    }
+}
+
+/*-----------------------------------------------------------
+ * Main
+ *-----------------------------------------------------------*/
+void app_main(void)
+{
+    i2c_master_init();
+    bme280_init();
+
+    ESP_LOGI(TAG, "=== Multi-Sensor I2C Coordinator ===");
+
+#if DEMO_MODE == 0
+    ESP_LOGI(TAG, "Mode: Normal (mutex with priority inheritance)");
+    xI2CMutex = xSemaphoreCreateMutex();
+    configASSERT(xI2CMutex != NULL);
+#elif DEMO_MODE == 1
+    ESP_LOGI(TAG, "Mode: Priority Inversion Demo");
+    xI2CBinarySem = xSemaphoreCreateBinary();
+    xSemaphoreGive(xI2CBinarySem);
+    xI2CMutex = xSemaphoreCreateMutex();
+    configASSERT(xI2CBinarySem != NULL);
+#elif DEMO_MODE == 2
+    ESP_LOGI(TAG, "Mode: Deadlock Demo");
+    xI2CMutex     = xSemaphoreCreateMutex();
+    xDisplayMutex = xSemaphoreCreateMutex();
+    configASSERT(xI2CMutex != NULL);
+    configASSERT(xDisplayMutex != NULL);
+#endif
+
+    xTaskCreate(vTempTask,     "Temp",     4096, NULL, 3, NULL);
+    xTaskCreate(vHumidityTask, "Humidity", 4096, NULL, 2, NULL);
+    xTaskCreate(vPressureTask, "Pressure", 4096, NULL, 1, NULL);
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Demonstrating Priority Inversion
+
+<InArticleAd />
+
+
+To see priority inversion in action, set `DEMO_MODE` to 1, compile, and flash. This mode replaces the mutex with a binary semaphore, removing priority inheritance. The pressure task (low priority) deliberately holds the semaphore for 50 ms to simulate a slow I2C transaction, and the humidity task (medium priority) runs a long computation loop after its read.
+
+### What Happens Without Priority Inheritance
+
+Open a serial terminal at 115200 baud. You will see output like this:
+
+```
+=== Multi-Sensor I2C Coordinator ===
+Mode: Priority Inversion Demo (binary semaphore, no inheritance)
+
+[PRESS ] Waiting for I2C mutex (tick 0)
+[PRESS ] Acquired I2C mutex (tick 0)
+[PRESS ] Holding lock during slow read...
+[TEMP  ] Waiting for I2C mutex (tick 500)
+[HUMID ] Waiting for I2C mutex (tick 1000)
+[HUMID ] Acquired I2C mutex (tick 1050)
+[HUMID ] Starting heavy computation...
+[HUMID ] Computation done (tick 1320)
+[HUMID ] 48.2 %, releasing mutex (tick 1320)
+[TEMP  ] Acquired I2C mutex (tick 1320)
+[TEMP  ] 24.3 C, releasing mutex (tick 1322)
+```
+
+Notice the timeline: the temperature task (priority 3) waited from tick 500 to tick 1320, a delay of 820 ms. It should have been the first to run after the pressure task released the lock. Instead, the humidity task's computation blocked the pressure task from finishing, and the temperature task had to wait for both.
+
+### What Happens With Priority Inheritance
+
+Set `DEMO_MODE` back to 0 (the mutex version). The same scenario now produces:
+
+```
+[PRESS ] Acquired I2C mutex (tick 0)
+[TEMP  ] Waiting for I2C mutex (tick 500)
+[PRESS ] 1013.2 hPa, releasing mutex (tick 505)
+[TEMP  ] Acquired I2C mutex (tick 505)
+[TEMP  ] 24.3 C, releasing mutex (tick 507)
+[HUMID ] Waiting for I2C mutex (tick 1000)
+[HUMID ] Acquired I2C mutex (tick 1000)
+```
+
+The temperature task waited only 5 ms (the time the pressure task needed to finish its read). When the temperature task blocked on the mutex, the scheduler boosted the pressure task to priority 3, preventing the humidity task from preempting it. The total delay dropped from 820 ms to 5 ms.
+
+## Demonstrating Deadlock
+
+<InArticleAd />
+
+
+Set `DEMO_MODE` to 2, compile, and flash. In this mode, the temperature task acquires the I2C mutex first and then the display mutex, while the humidity task acquires them in the opposite order.
+
+### Expected Serial Output
+
+```
+=== Multi-Sensor I2C Coordinator ===
+Mode: Deadlock Demo (two mutexes, opposite acquisition order)
+
+[TEMP  ] Waiting for I2C mutex (tick 0)
+[TEMP  ] Acquired I2C mutex, now taking Display mutex...
+[HUMID ] Waiting for I2C mutex (tick 0)
+[HUMID ] Acquired Display mutex, now taking I2C mutex...
+[TEMP  ] TIMEOUT waiting for Display mutex! Possible deadlock.
+[HUMID ] TIMEOUT waiting for I2C mutex! Possible deadlock.
+```
+
+Both tasks detect the deadlock through their 5-second timeouts and print a warning. Without the timeout (using `portMAX_DELAY` instead), both tasks would block forever, serial output would stop, and only a watchdog reset or power cycle would recover the system.
+
+### The Fix: Consistent Lock Ordering
+
+The solution is straightforward. Both tasks must acquire mutexes in the same order, for example always I2C first, then display:
+
+```c
+/* Task A */
+xSemaphoreTake(xI2CMutex, portMAX_DELAY);
+xSemaphoreTake(xDisplayMutex, portMAX_DELAY);
+/* ... work ... */
+xSemaphoreGive(xDisplayMutex);
+xSemaphoreGive(xI2CMutex);
+
+/* Task B: same order */
+xSemaphoreTake(xI2CMutex, portMAX_DELAY);
+xSemaphoreTake(xDisplayMutex, portMAX_DELAY);
+/* ... work ... */
+xSemaphoreGive(xDisplayMutex);
+xSemaphoreGive(xI2CMutex);
+```
+
+When both tasks follow the same ordering, the circular dependency cannot form. If Task A holds the I2C mutex and Task B wants it, Task B blocks on the I2C mutex. It never gets to the display mutex, so it cannot create the cycle.
+
+## Project Structure
+
+<InArticleAd />
+
+
+<FileTree>
+- rtos-semaphores-project/
+  - src/
+    - main.c
+  - include/
+    - FreeRTOSConfig.h
+  - platformio.ini
+</FileTree>
+
+The `platformio.ini` for the STM32 Blue Pill:
+
+```ini
+[env:bluepill]
+platform = ststm32
+board = bluepill_f103c8
+framework = stm32cube
+lib_deps =
+    FreeRTOS
+build_flags =
+    -D configUSE_MUTEXES=1
+    -D configUSE_COUNTING_SEMAPHORES=1
+    -D configUSE_PREEMPTION=1
+    -D configMAX_PRIORITIES=5
+monitor_speed = 115200
+```
+
+For the ESP32:
+
+```ini
+[env:esp32]
+platform = espressif32
+board = esp32dev
+framework = espidf
+monitor_speed = 115200
+build_flags =
+    -D configUSE_MUTEXES=1
+    -D configUSE_COUNTING_SEMAPHORES=1
+```
+
+Key build flags: `configUSE_MUTEXES` must be set to 1 to enable mutex support and priority inheritance. Without it, `xSemaphoreCreateMutex()` is not available and the project will not compile. Similarly, `configUSE_COUNTING_SEMAPHORES` enables counting semaphore support.
+
+## Experiments
+
+<InArticleAd />
+
+
+<CardGrid>
+<Card title="Recursive Mutex" icon="puzzle">
+Replace `xSemaphoreCreateMutex()` with `xSemaphoreCreateRecursiveMutex()`. A recursive mutex allows the same task to take it multiple times without deadlocking on itself. Call `xSemaphoreTakeRecursive()` in a function that reads multiple BME280 registers in sequence, where each sub-function also acquires the mutex. Count how many times you take it and verify you give it the same number of times.
+</Card>
+
+<Card title="Try-Lock Pattern" icon="puzzle">
+Use `xSemaphoreTake()` with a zero timeout to implement a try-lock. If the mutex is not immediately available, skip the reading and try again next cycle instead of blocking. Print a message each time the try-lock fails. Measure how often each task skips a reading under heavy contention.
+</Card>
+
+<Card title="Watchdog Deadlock Detector" icon="puzzle">
+Add a fourth task at the lowest priority that increments a counter every second and prints a heartbeat. If the heartbeat stops appearing in serial output, you know the system is deadlocked or starved. Extend this by having each sensor task write its last-alive tick to a shared array, and have the watchdog task check whether any task has not updated in more than 5 seconds.
+</Card>
+
+<Card title="Semaphore-Based Pipeline" icon="puzzle">
+Create a three-stage pipeline where binary semaphores signal between stages: a producer task reads the sensor and gives semaphore A, a filter task takes semaphore A and gives semaphore B, and a logger task takes semaphore B and prints the result. Compare the timing characteristics with the queue-based pipeline from the previous lesson.
+</Card>
+</CardGrid>
+
+## What You Have Learned
+
+<InArticleAd />
+
+
+<Card title="Lesson 4 Complete" icon="approve-check">
+
+**Synchronization primitives:**
+- Binary semaphores for task signaling and ISR-to-task notification
+- Counting semaphores for tracking pools of available resources
+- Mutexes for protecting shared resources with ownership tracking
+- The critical difference: semaphores signal, mutexes protect
+
+**Priority inheritance:**
+- How priority inversion occurs when a medium-priority task preempts a low-priority mutex holder
+- The Mars Pathfinder as a real-world priority inversion failure
+- How FreeRTOS mutexes automatically boost the holder's priority to prevent inversion
+- Measured the timing difference: 820 ms delay without inheritance vs. 5 ms with it
+
+**Deadlock:**
+- The circular dependency pattern with two mutexes acquired in opposite order
+- Prevention through consistent lock ordering, timeouts, and minimized lock scope
+- How to detect deadlock through heartbeat monitoring and timeout messages
+</Card>
+
+:::tip[Next Lesson]
+In [Lesson 5: Software Timers and Interrupt Management](/education/rtos-programming/software-timers-interrupt-management), you will build a system that combines hardware interrupts with FreeRTOS software timers. You will learn deferred interrupt processing, timer callbacks, one-shot and auto-reload timers, and how to safely bridge the gap between ISR context and task context.
+:::
+
+<RtosProgrammingComments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />

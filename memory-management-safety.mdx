@@ -1,0 +1,1368 @@
+---
+title: "Memory Management and Safety"
+description: "Build a memory-safe command processor using static allocation, stack watermarking, and MPU fault demonstration. Learn FreeRTOS heap schemes (heap_1 through heap_5), memory pools, stack overflow detection, and memory protection unit configuration."
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-02-21
+tags: ["rtos", "freertos", "memory", "heap", "mpu", "safety", "stack"]
+excerpt: "Create a UART command processor that uses only statically allocated FreeRTOS objects. Monitor stack usage with high-water marks, compare all five FreeRTOS heap schemes, and trigger an MPU fault to see how memory protection catches buffer overruns at runtime."
+heroImage: "https://cdn.siliconwit.com/education/rtos-programming/Real-Time-Operating-System-RTOS.jpeg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import RtosProgrammingComments from '../../../../components/rtos-programming/RtosProgrammingComments.astro';
+
+Embedded systems do not have virtual memory, swap files, or an operating system that politely terminates a process when it runs out of RAM. A single stack overflow or heap fragmentation bug can silently corrupt data, crash the firmware hours later, or create a safety hazard. In this lesson you will build a UART command processor that avoids dynamic allocation entirely by using FreeRTOS static allocation APIs. You will measure stack usage with high-water marks, compare the five FreeRTOS heap schemes to understand their tradeoffs, and configure the memory protection unit (MPU) to catch an intentional buffer overrun at the hardware level. #FreeRTOS #MemorySafety #MPU
+
+## What We Are Building
+
+<Card title="Memory-Safe Command Processor" icon="star">
+A UART-driven command processor where every FreeRTOS object (tasks, queues, semaphores) is statically allocated. The system accepts text commands over serial, parses them, and executes actions like toggling LEDs or reporting memory statistics. Stack watermarking monitors each task's peak usage. A deliberate buffer overflow triggers an MPU fault, demonstrating hardware-level memory protection.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| MCU | STM32 Blue Pill (STM32F103C8T6) or ESP32 DevKit |
+| RTOS | FreeRTOS with static allocation enabled |
+| Allocation mode | configSUPPORT_STATIC_ALLOCATION = 1 |
+| Heap schemes tested | heap_1, heap_2, heap_3, heap_4, heap_5 |
+| Stack monitoring | uxTaskGetStackHighWaterMark() on all tasks |
+| MPU demo | Deliberate out-of-bounds write triggers HardFault |
+| Interface | UART serial at 115200 baud |
+| Components | MCU board only (reuse existing hardware) |
+
+### Parts List
+
+| Ref | Component | Quantity | Notes |
+|-----|-----------|----------|-------|
+| U1 | STM32 Blue Pill or ESP32 DevKit | 1 | Reuse from prior courses |
+| - | USB-to-Serial adapter | 1 | If not using USB CDC (reuse from prior courses) |
+| - | Jumper wires | Several | For UART connections if needed |
+
+## Why Memory Matters in Embedded Systems
+
+<InArticleAd />
+
+
+On a desktop PC, the operating system gives each process its own virtual address space backed by gigabytes of physical RAM and disk-based swap. If a process allocates too much memory, the OS can page out other processes, kill the offender, or simply slow everything down. None of this exists on a microcontroller. The STM32F103C8T6 has 20 KB of SRAM. That is the total. Every task stack, every queue buffer, every global variable, and the FreeRTOS kernel data structures all share that 20 KB with no protection between them.
+
+Three failure modes dominate embedded memory bugs:
+
+**Stack overflow.** Each FreeRTOS task has its own stack, allocated at task creation. If a function call chain goes too deep, or a local array is too large, the stack pointer grows past the allocated region and silently overwrites whatever sits below it in memory. This might be another task's stack, a queue buffer, or the kernel's internal state. The corruption may not cause a visible crash for minutes or hours, making it extremely difficult to diagnose.
+
+**Heap fragmentation.** If your application repeatedly allocates and frees different-sized blocks, the heap gradually breaks into small non-contiguous fragments. Eventually a perfectly reasonable allocation fails because no single contiguous block is large enough, even though the total free memory is sufficient. On a desktop this might cause a minor slowdown. On a microcontroller it means your firmware stops working in the field.
+
+**Memory leaks.** Forgetting to free allocated memory is less obvious on an embedded system because there is no process exit to reclaim everything. The leak accumulates across days or weeks of continuous operation until the heap is exhausted.
+
+The solution used by most safety-critical embedded systems is straightforward: avoid dynamic allocation entirely. Allocate everything at startup, use fixed-size buffers, and verify at compile time that everything fits. FreeRTOS supports this approach through its static allocation API, and this lesson is built around that philosophy.
+
+## FreeRTOS Heap Schemes
+
+<InArticleAd />
+
+
+FreeRTOS does not use the standard C library `malloc` and `free` by default. Instead, it provides five heap implementation files in the `portable/MemMang/` directory. You link exactly one of these into your project, and all FreeRTOS internal allocations (tasks, queues, semaphores created with the dynamic API) go through it.
+
+| Scheme | Allocate | Free | Coalescing | Best For |
+|--------|----------|------|------------|----------|
+| heap_1 | Yes | No | N/A | Systems that create all objects at startup and never delete them. Simplest, fully deterministic, zero fragmentation risk. |
+| heap_2 | Yes | Yes | No | Systems that create and delete objects of the same size. Uses best-fit algorithm. Risk: fragmentation if block sizes vary. |
+| heap_3 | Yes | Yes | Depends on libc | Wraps standard `malloc`/`free` with scheduler suspension for thread safety. Useful when you need compatibility with third-party libraries that call `malloc`. |
+| heap_4 | Yes | Yes | Yes | General-purpose embedded use. Combines adjacent free blocks to reduce fragmentation. The most common choice for non-safety-critical applications. |
+| heap_5 | Yes | Yes | Yes | Like heap_4 but supports non-contiguous memory regions. Required when your MCU has multiple RAM banks (e.g., STM32F4 with CCM and main SRAM). |
+
+### Selecting a Heap Scheme
+
+In your build system, you include exactly one of the five source files. For example, in a Makefile:
+
+```makefile
+# Choose ONE of these:
+SRCS += $(FREERTOS)/portable/MemMang/heap_1.c   # Allocate only
+# SRCS += $(FREERTOS)/portable/MemMang/heap_2.c # Alloc + free, no coalescing
+# SRCS += $(FREERTOS)/portable/MemMang/heap_3.c # Wraps malloc/free
+# SRCS += $(FREERTOS)/portable/MemMang/heap_4.c # Alloc + free + coalescing
+# SRCS += $(FREERTOS)/portable/MemMang/heap_5.c # heap_4 + non-contiguous RAM
+```
+
+If you use PlatformIO with the STM32Cube framework, the heap scheme is typically configured through the build flags or by placing the desired `heap_X.c` file in your source tree.
+
+### Heap Statistics
+
+When using heap_1, heap_2, heap_4, or heap_5, you can query the heap at runtime:
+
+```c
+size_t free_heap = xPortGetFreeHeapSize();
+size_t min_ever  = xPortGetMinimumEverFreeHeapSize();
+
+char buf[64];
+snprintf(buf, sizeof(buf), "Heap free: %u bytes, min ever: %u bytes\r\n",
+         (unsigned)free_heap, (unsigned)min_ever);
+uart_send_string(buf);
+```
+
+The `xPortGetMinimumEverFreeHeapSize` function returns the smallest amount of free heap that has existed since boot. If this number approaches zero, your system is close to running out of memory.
+
+## Static Allocation
+
+<InArticleAd />
+
+
+The safest approach to memory on embedded systems is to eliminate dynamic allocation entirely. FreeRTOS supports this through its static allocation API. When `configSUPPORT_STATIC_ALLOCATION` is set to 1 in `FreeRTOSConfig.h`, you can create tasks, queues, semaphores, and timers using caller-provided buffers. The kernel never calls `pvPortMalloc` for these objects.
+
+### Enabling Static Allocation
+
+```c
+/* FreeRTOSConfig.h */
+#define configSUPPORT_STATIC_ALLOCATION     1
+
+/* You can disable dynamic allocation entirely if desired: */
+#define configSUPPORT_DYNAMIC_ALLOCATION    0
+```
+
+When static allocation is enabled, FreeRTOS requires you to provide memory for the idle task and (if software timers are used) the timer task. You do this by implementing two callback functions:
+
+```c
+/* Required when configSUPPORT_STATIC_ALLOCATION == 1 */
+
+static StaticTask_t xIdleTaskTCB;
+static StackType_t  xIdleTaskStack[configMINIMAL_STACK_SIZE];
+
+void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer,
+                                   StackType_t **ppxIdleTaskStackBuffer,
+                                   uint32_t *pulIdleTaskStackSize)
+{
+    *ppxIdleTaskTCBBuffer   = &xIdleTaskTCB;
+    *ppxIdleTaskStackBuffer = xIdleTaskStack;
+    *pulIdleTaskStackSize   = configMINIMAL_STACK_SIZE;
+}
+
+static StaticTask_t xTimerTaskTCB;
+static StackType_t  xTimerTaskStack[configTIMER_TASK_STACK_DEPTH];
+
+void vApplicationGetTimerTaskMemory(StaticTask_t **ppxTimerTaskTCBBuffer,
+                                    StackType_t **ppxTimerTaskStackBuffer,
+                                    uint32_t *pulTimerTaskStackSize)
+{
+    *ppxTimerTaskTCBBuffer   = &xTimerTaskTCB;
+    *ppxTimerTaskStackBuffer = xTimerTaskStack;
+    *pulTimerTaskStackSize   = configTIMER_TASK_STACK_DEPTH;
+}
+```
+
+### Creating Static Tasks
+
+Instead of `xTaskCreate`, use `xTaskCreateStatic`. You provide the stack buffer and the task control block (TCB) storage:
+
+```c
+#define CMD_TASK_STACK_SIZE  256
+
+static StaticTask_t xCmdTaskTCB;
+static StackType_t  xCmdTaskStack[CMD_TASK_STACK_SIZE];
+
+TaskHandle_t xCmdTask = xTaskCreateStatic(
+    vCommandTask,           /* Task function */
+    "CmdTask",              /* Name (for debugging) */
+    CMD_TASK_STACK_SIZE,    /* Stack size in words */
+    NULL,                   /* Parameters */
+    2,                      /* Priority */
+    xCmdTaskStack,          /* Stack buffer */
+    &xCmdTaskTCB            /* TCB buffer */
+);
+```
+
+### Creating Static Queues and Semaphores
+
+The same pattern applies to queues and semaphores:
+
+```c
+/* Static queue */
+#define CMD_QUEUE_LENGTH  8
+#define CMD_ITEM_SIZE     sizeof(char *)
+
+static StaticQueue_t xCmdQueueStatic;
+static uint8_t ucCmdQueueStorage[CMD_QUEUE_LENGTH * CMD_ITEM_SIZE];
+
+QueueHandle_t xCmdQueue = xQueueCreateStatic(
+    CMD_QUEUE_LENGTH,
+    CMD_ITEM_SIZE,
+    ucCmdQueueStorage,
+    &xCmdQueueStatic
+);
+
+/* Static mutex */
+static StaticSemaphore_t xUartMutexStatic;
+
+SemaphoreHandle_t xUartMutex = xSemaphoreCreateMutexStatic(&xUartMutexStatic);
+```
+
+The key benefit is that all memory is visible in the linker map file. You can verify at compile time that your total static allocations fit in the available SRAM. No runtime surprises.
+
+## Stack Watermarking
+
+<InArticleAd />
+
+
+Every FreeRTOS task has a fixed-size stack allocated at creation time. If you allocate too little, the task overflows its stack and corrupts adjacent memory. If you allocate too much, you waste precious SRAM. Stack watermarking helps you find the right balance.
+
+### How It Works
+
+When FreeRTOS creates a task, it fills the entire stack with a known pattern: `0xA5A5A5A5` (the exact value depends on the port). As the task runs, function calls and local variables overwrite this pattern from the top of the stack downward. The `uxTaskGetStackHighWaterMark` function scans from the bottom of the stack upward, counting how many words still contain the fill pattern. The result is the **high-water mark**: the minimum number of unused stack words since the task started.
+
+```
+Stack memory layout (growing downward on ARM):
+
+High address  ┌───────────────────────┐
+              │ 0xA5A5A5A5 (unused)   │  <- Stack bottom (lowest address used)
+              │ 0xA5A5A5A5            │
+              │ 0xA5A5A5A5            │
+              │ ---- watermark ----   │  <- Deepest point ever reached
+              │ local variables       │
+              │ saved registers       │
+              │ return addresses      │
+Low address   │ stack pointer (SP)    │  <- Current top of stack
+              └───────────────────────┘
+```
+
+A high-water mark of 20 words means the task came within 20 words (80 bytes on a 32-bit platform) of overflowing. As a rule of thumb, you want at least 20 to 30% of the stack to remain unused as a safety margin.
+
+### Monitoring Task
+
+This task prints the high-water mark for every task in the system at regular intervals:
+
+```c
+static void vMonitorTask(void *pvParameters) {
+    char buf[64];
+
+    for (;;) {
+        uart_send_string("\r\n--- Stack High-Water Marks ---\r\n");
+
+        /* Get high-water mark for each known task */
+        TaskHandle_t tasks[] = {xUartRxTask, xCommandTask, xMonitorTaskHandle};
+        const char *names[]  = {"UartRx", "Command", "Monitor"};
+
+        for (int i = 0; i < 3; i++) {
+            if (tasks[i] != NULL) {
+                UBaseType_t hwm = uxTaskGetStackHighWaterMark(tasks[i]);
+                snprintf(buf, sizeof(buf), "  %-10s : %u words free\r\n",
+                         names[i], (unsigned)hwm);
+                uart_send_string(buf);
+            }
+        }
+
+        /* Heap statistics */
+        snprintf(buf, sizeof(buf), "  Heap free  : %u bytes\r\n",
+                 (unsigned)xPortGetFreeHeapSize());
+        uart_send_string(buf);
+
+        snprintf(buf, sizeof(buf), "  Heap min   : %u bytes\r\n",
+                 (unsigned)xPortGetMinimumEverFreeHeapSize());
+        uart_send_string(buf);
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+```
+
+### Using vTaskList for a Formatted Task Table
+
+FreeRTOS can produce a formatted table of all tasks if you enable `configUSE_TRACE_FACILITY` and `configUSE_STATS_FORMATTING_FUNCTIONS` in `FreeRTOSConfig.h`:
+
+```c
+#define configUSE_TRACE_FACILITY                1
+#define configUSE_STATS_FORMATTING_FUNCTIONS    1
+```
+
+Then call `vTaskList`:
+
+```c
+char task_list_buf[512];
+vTaskList(task_list_buf);
+uart_send_string("Name          State  Prio  Stack  Num\r\n");
+uart_send_string(task_list_buf);
+```
+
+The output looks like this:
+
+```
+Name          State  Prio  Stack  Num
+UartRx        R      2     82     1
+Command       B      2     104    2
+Monitor       R      1     156    3
+IDLE          R      0     58     4
+```
+
+State codes: R = Ready, B = Blocked, S = Suspended, D = Deleted. The Stack column shows the high-water mark in words.
+
+## Stack Overflow Detection
+
+<InArticleAd />
+
+
+Stack watermarking tells you how close a task came to overflow, but it is passive. You check it periodically and hope you catch problems before they cause damage. FreeRTOS also provides active stack overflow detection that catches overflows as they happen (or shortly after).
+
+### Method 1: Stack Pointer Check
+
+Set `configCHECK_FOR_STACK_OVERFLOW` to 1 in `FreeRTOSConfig.h`:
+
+```c
+#define configCHECK_FOR_STACK_OVERFLOW  1
+```
+
+At every context switch, the kernel checks whether the current task's stack pointer has gone past the end of its allocated stack. If it has, the kernel calls `vApplicationStackOverflowHook`. This method is fast (one comparison per context switch) but can miss overflows that happen and recover within a single time slice. If the stack briefly overflows during a deep function call but returns before the next context switch, the damage is done but the check does not catch it.
+
+### Method 2: Pattern Check
+
+Set `configCHECK_FOR_STACK_OVERFLOW` to 2:
+
+```c
+#define configCHECK_FOR_STACK_OVERFLOW  2
+```
+
+In addition to the stack pointer check, the kernel verifies that the last 20 bytes of the stack still contain the fill pattern (`0xA5A5A5A5`). If any of those bytes have been overwritten, the overflow hook is called. This catches more cases than Method 1 because even transient overflows that corrupt the guard region are detected. The overhead is slightly higher (checking 20 bytes instead of one pointer).
+
+### The Overflow Hook
+
+You must implement this function. It is called from the context of the tick interrupt, so it must not call any blocking functions:
+
+```c
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
+    /* Called when a stack overflow is detected. */
+    /* pcTaskName contains the name of the offending task. */
+
+    /* In a real system, log the task name to non-volatile storage, */
+    /* set an error LED, and reset. */
+    (void)xTask;
+
+    uart_send_string("!!! STACK OVERFLOW: ");
+    uart_send_string(pcTaskName);
+    uart_send_string(" !!!\r\n");
+
+    /* Halt the system */
+    taskDISABLE_INTERRUPTS();
+    for (;;);
+}
+```
+
+### Deliberate Overflow Demonstration
+
+To see the detection in action, create a function that recursively consumes stack until it overflows:
+
+```c
+static volatile uint32_t recurse_depth = 0;
+
+static void stack_overflow_recurse(void) {
+    volatile uint8_t padding[64];  /* Consume 64 bytes per call */
+    (void)padding;
+    recurse_depth++;
+    stack_overflow_recurse();       /* Never returns */
+}
+
+/* Triggered by the "overflow" command */
+static void trigger_stack_overflow(void) {
+    uart_send_string("Triggering deliberate stack overflow...\r\n");
+    recurse_depth = 0;
+    stack_overflow_recurse();
+}
+```
+
+When the overflow is detected, you will see the hook fire with the offending task's name. The recursion depth at which it fires depends on the task's stack size and the overhead per frame.
+
+## Memory Protection Unit (MPU)
+
+<InArticleAd />
+
+
+The Memory Protection Unit is a hardware feature that restricts which memory regions a piece of code can access. When a task tries to read or write an address outside its permitted regions, the MPU generates a fault exception (MemManage or HardFault), stopping the offending code immediately rather than letting it silently corrupt memory.
+
+### STM32F1 Limitation
+
+The STM32F103 (Cortex-M3) used on the Blue Pill does not include an MPU. The Cortex-M3 architecture defines the MPU as optional, and ST chose not to include it in the F1 value line. If you need hardware memory protection, you will need a Cortex-M4 or Cortex-M7 device (STM32F4, F7, H7) or an ESP32, all of which include an MPU or equivalent memory protection.
+
+### FreeRTOS MPU Port
+
+FreeRTOS provides an MPU-aware port for Cortex-M devices with an MPU. In this configuration, the idle task and kernel code run in privileged mode with full memory access. User tasks run in unprivileged mode and can only access:
+
+1. Their own stack
+2. Up to three additional memory regions explicitly granted at task creation
+3. Shared read-only regions (like flash for code and constants)
+
+A task that tries to access another task's stack or an ungranted peripheral register triggers a MemManage fault.
+
+### Conceptual Configuration
+
+While we cannot demonstrate the full MPU port on the Blue Pill (it lacks the hardware), here is how you would configure it on an STM32F4:
+
+```c
+/* Task definition with MPU regions (Cortex-M4/M7 only) */
+static const TaskParameters_t xCommandTaskParams = {
+    .pvTaskCode   = vCommandTask,
+    .pcName       = "CmdTask",
+    .usStackDepth = CMD_TASK_STACK_SIZE,
+    .pvParameters = NULL,
+    .uxPriority   = 2 | portPRIVILEGE_BIT,  /* Remove portPRIVILEGE_BIT for unprivileged */
+    .puxStackBuffer = xCmdTaskStack,
+    .xRegions = {
+        /* Region 0: Allow access to UART peripheral registers */
+        { (void *)0x40011000, 0x400, portMPU_REGION_READ_WRITE },
+        /* Region 1: Allow access to a shared data buffer */
+        { (void *)shared_buffer, sizeof(shared_buffer), portMPU_REGION_READ_WRITE },
+        /* Region 2: unused */
+        { 0, 0, 0 },
+    }
+};
+
+xTaskCreateRestricted(&xCommandTaskParams, &xCommandTaskHandle);
+```
+
+### HardFault on the Blue Pill
+
+Even without an MPU, the Cortex-M3 still faults on some invalid accesses. Writing to an address that does not map to any peripheral or SRAM region triggers a BusFault, which escalates to a HardFault if BusFault is not explicitly enabled. We can demonstrate this:
+
+```c
+static void trigger_hardfault(void) {
+    uart_send_string("Writing to invalid address 0x60000000...\r\n");
+    /* Small delay so the UART output completes */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* This address is not mapped to any memory or peripheral on STM32F1 */
+    volatile uint32_t *bad_ptr = (volatile uint32_t *)0x60000000;
+    *bad_ptr = 0xDEADBEEF;  /* Triggers BusFault -> HardFault */
+
+    /* Never reaches here */
+    uart_send_string("This line will never print\r\n");
+}
+
+/* Minimal HardFault handler that reports the fault */
+void HardFault_Handler(void) {
+    uart_send_string("\r\n!!! HARDFAULT DETECTED !!!\r\n");
+
+    /* In production: log registers, reset the device */
+    taskDISABLE_INTERRUPTS();
+    for (;;);
+}
+```
+
+The key takeaway: on devices with an MPU, every task gets its own sandbox. On devices without one (like the Blue Pill), you rely on defensive programming, static analysis, and stack overflow detection to catch bugs before deployment.
+
+## Memory Pools
+
+<InArticleAd />
+
+
+Dynamic allocation (even with heap_4 coalescing) carries fragmentation risk when block sizes vary. A memory pool eliminates this risk entirely by pre-allocating a fixed number of identically sized blocks. Allocation and deallocation are both O(1), with zero fragmentation by design.
+
+### Pool Using a FreeRTOS Queue
+
+The simplest way to implement a memory pool in FreeRTOS is to use a queue of pointers. At initialization, you create N buffers and push their addresses into a queue. To allocate, a task takes a pointer from the queue. To free, it gives the pointer back. The queue handles all synchronization automatically.
+
+```c
+#define POOL_BLOCK_SIZE    64   /* Bytes per block */
+#define POOL_BLOCK_COUNT   8    /* Number of blocks */
+
+static uint8_t pool_storage[POOL_BLOCK_COUNT][POOL_BLOCK_SIZE];
+static QueueHandle_t xPoolQueue;
+
+/* Initialize the pool: push all block addresses into the queue */
+void pool_init(void) {
+    xPoolQueue = xQueueCreate(POOL_BLOCK_COUNT, sizeof(void *));
+    configASSERT(xPoolQueue != NULL);
+
+    for (int i = 0; i < POOL_BLOCK_COUNT; i++) {
+        void *ptr = &pool_storage[i][0];
+        xQueueSend(xPoolQueue, &ptr, 0);
+    }
+}
+
+/* Allocate a block (blocks if pool is empty) */
+void *pool_alloc(TickType_t timeout) {
+    void *ptr = NULL;
+    if (xQueueReceive(xPoolQueue, &ptr, timeout) == pdPASS) {
+        return ptr;
+    }
+    return NULL;  /* Pool exhausted */
+}
+
+/* Free a block back to the pool */
+void pool_free(void *ptr) {
+    xQueueSend(xPoolQueue, &ptr, 0);
+}
+```
+
+### Why This Works
+
+The queue enforces a maximum of N outstanding allocations. Every block is the same size, so there is no fragmentation. The queue's built-in blocking means a task that tries to allocate from an empty pool can either wait for a block to be returned or timeout and handle the failure gracefully. ISR-safe variants (`xQueueReceiveFromISR`, `xQueueSendFromISR`) let you use the pool from interrupt context too.
+
+In the complete project below, command buffers are allocated from a memory pool. Each UART command string gets a pool block, passes through the command queue, and returns to the pool after processing.
+
+## Complete Project: Memory-Safe Command Processor
+
+<InArticleAd />
+
+
+This is the full application. All FreeRTOS objects are statically allocated. Three tasks cooperate: a UART receiver assembles incoming characters into command strings, a command processor parses and executes them, and a monitor task prints stack and heap statistics every 5 seconds. Command buffers come from a memory pool built on a queue of pointers.
+
+Supported commands:
+
+| Command | Action |
+|---------|--------|
+| `led on` | Turn on the onboard LED (PC13) |
+| `led off` | Turn off the onboard LED (PC13) |
+| `status` | Print stack watermarks and heap statistics |
+| `stress` | Allocate and free memory blocks to demonstrate fragmentation |
+| `overflow` | Trigger a deliberate stack overflow for demonstration |
+
+<Tabs>
+<TabItem label="STM32 Blue Pill">
+
+```c
+/* main.c - Memory-Safe Command Processor on STM32 Blue Pill */
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "semphr.h"
+
+#include "stm32f1xx.h"
+#include "clock.h"
+#include "uart.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/* ---------- Configuration ---------- */
+#define UART_RX_STACK_SIZE    256
+#define CMD_TASK_STACK_SIZE   256
+#define MONITOR_STACK_SIZE    384
+
+#define CMD_QUEUE_LENGTH      8
+#define CMD_BUF_SIZE          64
+#define POOL_BLOCK_COUNT      8
+
+/* ---------- Static Task Buffers ---------- */
+static StaticTask_t xUartRxTCB;
+static StackType_t  xUartRxStack[UART_RX_STACK_SIZE];
+
+static StaticTask_t xCmdTaskTCB;
+static StackType_t  xCmdTaskStack[CMD_TASK_STACK_SIZE];
+
+static StaticTask_t xMonitorTCB;
+static StackType_t  xMonitorStack[MONITOR_STACK_SIZE];
+
+/* Idle and Timer task memory (required for static allocation) */
+static StaticTask_t xIdleTaskTCB;
+static StackType_t  xIdleTaskStack[configMINIMAL_STACK_SIZE];
+
+static StaticTask_t xTimerTaskTCB;
+static StackType_t  xTimerTaskStack[configTIMER_TASK_STACK_DEPTH];
+
+/* ---------- Static Queue Buffers ---------- */
+static StaticQueue_t xCmdQueueStatic;
+static uint8_t ucCmdQueueStorage[CMD_QUEUE_LENGTH * sizeof(char *)];
+
+/* ---------- Static Mutex ---------- */
+static StaticSemaphore_t xUartMutexStatic;
+
+/* ---------- Task Handles ---------- */
+static TaskHandle_t xUartRxTask;
+static TaskHandle_t xCommandTask;
+static TaskHandle_t xMonitorTaskHandle;
+
+/* ---------- RTOS Objects ---------- */
+static QueueHandle_t     xCmdQueue;
+static SemaphoreHandle_t xUartMutex;
+
+/* ---------- Memory Pool ---------- */
+static uint8_t pool_storage[POOL_BLOCK_COUNT][CMD_BUF_SIZE];
+static StaticQueue_t xPoolQueueStatic;
+static uint8_t ucPoolQueueStorage[POOL_BLOCK_COUNT * sizeof(void *)];
+static QueueHandle_t xPoolQueue;
+
+static void pool_init(void) {
+    xPoolQueue = xQueueCreateStatic(
+        POOL_BLOCK_COUNT, sizeof(void *),
+        ucPoolQueueStorage, &xPoolQueueStatic
+    );
+    for (int i = 0; i < POOL_BLOCK_COUNT; i++) {
+        void *ptr = &pool_storage[i][0];
+        xQueueSend(xPoolQueue, &ptr, 0);
+    }
+}
+
+static void *pool_alloc(TickType_t timeout) {
+    void *ptr = NULL;
+    if (xQueueReceive(xPoolQueue, &ptr, timeout) == pdPASS) {
+        return ptr;
+    }
+    return NULL;
+}
+
+static void pool_free(void *ptr) {
+    xQueueSend(xPoolQueue, &ptr, 0);
+}
+
+/* ---------- Required Callbacks ---------- */
+void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer,
+                                   StackType_t **ppxIdleTaskStackBuffer,
+                                   uint32_t *pulIdleTaskStackSize)
+{
+    *ppxIdleTaskTCBBuffer   = &xIdleTaskTCB;
+    *ppxIdleTaskStackBuffer = xIdleTaskStack;
+    *pulIdleTaskStackSize   = configMINIMAL_STACK_SIZE;
+}
+
+void vApplicationGetTimerTaskMemory(StaticTask_t **ppxTimerTaskTCBBuffer,
+                                    StackType_t **ppxTimerTaskStackBuffer,
+                                    uint32_t *pulTimerTaskStackSize)
+{
+    *ppxTimerTaskTCBBuffer   = &xTimerTaskTCB;
+    *ppxTimerTaskStackBuffer = xTimerTaskStack;
+    *pulTimerTaskStackSize   = configTIMER_TASK_STACK_DEPTH;
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
+    (void)xTask;
+    uart_send_string("\r\n!!! STACK OVERFLOW: ");
+    uart_send_string(pcTaskName);
+    uart_send_string(" !!!\r\n");
+    taskDISABLE_INTERRUPTS();
+    for (;;);
+}
+
+/* ---------- LED Control ---------- */
+static void led_init(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
+    /* PC13: output push-pull, 2 MHz */
+    GPIOC->CRH &= ~(0xF << 20);
+    GPIOC->CRH |= (0x2 << 20);
+    GPIOC->BSRR = GPIO_BSRR_BS13;  /* LED off (active low) */
+}
+
+static void led_on(void)  { GPIOC->BSRR = GPIO_BSRR_BR13; }
+static void led_off(void) { GPIOC->BSRR = GPIO_BSRR_BS13; }
+
+/* ---------- Thread-safe UART print ---------- */
+static void safe_print(const char *str) {
+    xSemaphoreTake(xUartMutex, portMAX_DELAY);
+    uart_send_string(str);
+    xSemaphoreGive(xUartMutex);
+}
+
+/* ---------- Stack Overflow Demo ---------- */
+static volatile uint32_t recurse_depth = 0;
+
+static void stack_overflow_recurse(void) {
+    volatile uint8_t padding[64];
+    (void)padding;
+    recurse_depth++;
+    stack_overflow_recurse();
+}
+
+/* ---------- Stress Test ---------- */
+static void stress_test(void) {
+    char buf[80];
+    safe_print("Running memory stress test...\r\n");
+
+    void *blocks[POOL_BLOCK_COUNT];
+    int allocated = 0;
+
+    /* Allocate all blocks from pool */
+    for (int i = 0; i < POOL_BLOCK_COUNT; i++) {
+        blocks[i] = pool_alloc(0);
+        if (blocks[i] != NULL) {
+            allocated++;
+            memset(blocks[i], 0xBB, CMD_BUF_SIZE);
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "  Allocated %d/%d pool blocks\r\n",
+             allocated, POOL_BLOCK_COUNT);
+    safe_print(buf);
+
+    /* Try one more (should fail) */
+    void *extra = pool_alloc(0);
+    if (extra == NULL) {
+        safe_print("  Extra alloc correctly failed (pool exhausted)\r\n");
+    }
+
+    /* Free half the blocks */
+    for (int i = 0; i < allocated / 2; i++) {
+        pool_free(blocks[i]);
+        blocks[i] = NULL;
+    }
+
+    snprintf(buf, sizeof(buf), "  Freed %d blocks, re-allocating...\r\n",
+             allocated / 2);
+    safe_print(buf);
+
+    /* Re-allocate (should succeed) */
+    int reallocated = 0;
+    for (int i = 0; i < allocated / 2; i++) {
+        blocks[i] = pool_alloc(0);
+        if (blocks[i] != NULL) reallocated++;
+    }
+
+    snprintf(buf, sizeof(buf), "  Re-allocated %d blocks (zero fragmentation)\r\n",
+             reallocated);
+    safe_print(buf);
+
+    /* Free everything */
+    for (int i = 0; i < POOL_BLOCK_COUNT; i++) {
+        if (blocks[i] != NULL) {
+            pool_free(blocks[i]);
+        }
+    }
+
+    safe_print("  Stress test complete. All blocks returned.\r\n");
+}
+
+/* ---------- Print Status ---------- */
+static void print_status(void) {
+    char buf[80];
+
+    safe_print("\r\n--- System Status ---\r\n");
+
+    TaskHandle_t tasks[] = {xUartRxTask, xCommandTask, xMonitorTaskHandle};
+    const char *names[]  = {"UartRx", "Command", "Monitor"};
+
+    for (int i = 0; i < 3; i++) {
+        if (tasks[i] != NULL) {
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(tasks[i]);
+            snprintf(buf, sizeof(buf), "  %-10s : %u words free\r\n",
+                     names[i], (unsigned)hwm);
+            safe_print(buf);
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "  Heap free  : %u bytes\r\n",
+             (unsigned)xPortGetFreeHeapSize());
+    safe_print(buf);
+
+    snprintf(buf, sizeof(buf), "  Heap min   : %u bytes\r\n",
+             (unsigned)xPortGetMinimumEverFreeHeapSize());
+    safe_print(buf);
+
+    UBaseType_t pool_avail = uxQueueMessagesWaiting(xPoolQueue);
+    snprintf(buf, sizeof(buf), "  Pool avail : %u/%d blocks\r\n",
+             (unsigned)pool_avail, POOL_BLOCK_COUNT);
+    safe_print(buf);
+}
+
+/* ---------- UART Receive Task ---------- */
+static void vUartRxTask(void *pvParameters) {
+    (void)pvParameters;
+    char *cmd_buf = NULL;
+    uint8_t idx = 0;
+
+    for (;;) {
+        char c;
+        if (uart_receive_char(&c, portMAX_DELAY)) {
+            /* Echo the character */
+            xSemaphoreTake(xUartMutex, portMAX_DELAY);
+            uart_send_char(c);
+            xSemaphoreGive(xUartMutex);
+
+            /* Allocate a buffer on the first character of a new command */
+            if (cmd_buf == NULL) {
+                cmd_buf = (char *)pool_alloc(pdMS_TO_TICKS(100));
+                if (cmd_buf == NULL) {
+                    safe_print("\r\n[Pool exhausted]\r\n");
+                    continue;
+                }
+                idx = 0;
+            }
+
+            if (c == '\r' || c == '\n') {
+                if (idx > 0) {
+                    cmd_buf[idx] = '\0';
+                    /* Send the buffer pointer to the command queue */
+                    if (xQueueSend(xCmdQueue, &cmd_buf, pdMS_TO_TICKS(100)) != pdPASS) {
+                        safe_print("\r\n[Cmd queue full]\r\n");
+                        pool_free(cmd_buf);
+                    }
+                    cmd_buf = NULL;  /* Buffer ownership transferred */
+                    idx = 0;
+                    safe_print("\r\n");
+                }
+            } else if (idx < CMD_BUF_SIZE - 1) {
+                cmd_buf[idx++] = c;
+            }
+        }
+    }
+}
+
+/* ---------- Command Task ---------- */
+static void vCommandTaskFn(void *pvParameters) {
+    (void)pvParameters;
+    char *cmd;
+
+    for (;;) {
+        if (xQueueReceive(xCmdQueue, &cmd, portMAX_DELAY) == pdPASS) {
+            if (strcmp(cmd, "led on") == 0) {
+                led_on();
+                safe_print("LED on\r\n");
+            } else if (strcmp(cmd, "led off") == 0) {
+                led_off();
+                safe_print("LED off\r\n");
+            } else if (strcmp(cmd, "status") == 0) {
+                print_status();
+            } else if (strcmp(cmd, "stress") == 0) {
+                stress_test();
+            } else if (strcmp(cmd, "overflow") == 0) {
+                safe_print("Triggering stack overflow...\r\n");
+                recurse_depth = 0;
+                stack_overflow_recurse();
+            } else {
+                safe_print("Unknown command: ");
+                safe_print(cmd);
+                safe_print("\r\n");
+                safe_print("Commands: led on, led off, status, stress, overflow\r\n");
+            }
+
+            /* Return buffer to pool */
+            pool_free(cmd);
+        }
+    }
+}
+
+/* ---------- Monitor Task ---------- */
+static void vMonitorTaskFn(void *pvParameters) {
+    (void)pvParameters;
+
+    for (;;) {
+        print_status();
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+/* ---------- Main ---------- */
+int main(void) {
+    clock_init();
+    uart_init();
+    led_init();
+
+    /* Initialize memory pool */
+    pool_init();
+
+    /* Create static queue */
+    xCmdQueue = xQueueCreateStatic(
+        CMD_QUEUE_LENGTH, sizeof(char *),
+        ucCmdQueueStorage, &xCmdQueueStatic
+    );
+
+    /* Create static mutex */
+    xUartMutex = xSemaphoreCreateMutexStatic(&xUartMutexStatic);
+
+    /* Create static tasks */
+    xUartRxTask = xTaskCreateStatic(
+        vUartRxTask, "UartRx", UART_RX_STACK_SIZE,
+        NULL, 2, xUartRxStack, &xUartRxTCB
+    );
+
+    xCommandTask = xTaskCreateStatic(
+        vCommandTaskFn, "Command", CMD_TASK_STACK_SIZE,
+        NULL, 2, xCmdTaskStack, &xCmdTaskTCB
+    );
+
+    xMonitorTaskHandle = xTaskCreateStatic(
+        vMonitorTaskFn, "Monitor", MONITOR_STACK_SIZE,
+        NULL, 1, xMonitorStack, &xMonitorTCB
+    );
+
+    uart_send_string("=== Memory-Safe Command Processor ===\r\n");
+    uart_send_string("Commands: led on, led off, status, stress, overflow\r\n");
+    uart_send_string("> ");
+
+    vTaskStartScheduler();
+
+    for (;;);  /* Should never reach here */
+}
+```
+
+</TabItem>
+<TabItem label="ESP32 DevKit">
+
+```c
+/* main.c - Memory-Safe Command Processor on ESP32 (ESP-IDF) */
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+#include <stdio.h>
+#include <string.h>
+
+static const char *TAG = "cmdproc";
+
+/* ---------- Configuration ---------- */
+#define UART_RX_STACK_SIZE    2048
+#define CMD_TASK_STACK_SIZE   2048
+#define MONITOR_STACK_SIZE    3072
+
+#define CMD_QUEUE_LENGTH      8
+#define CMD_BUF_SIZE          64
+#define POOL_BLOCK_COUNT      8
+
+#define LED_PIN               GPIO_NUM_2    /* Onboard LED on most ESP32 DevKits */
+#define UART_NUM              UART_NUM_0
+#define UART_BUF_SIZE         256
+
+/* ---------- Static Task Buffers ---------- */
+static StaticTask_t xUartRxTCB;
+static StackType_t  xUartRxStack[UART_RX_STACK_SIZE];
+
+static StaticTask_t xCmdTaskTCB;
+static StackType_t  xCmdTaskStack[CMD_TASK_STACK_SIZE];
+
+static StaticTask_t xMonitorTCB;
+static StackType_t  xMonitorStack[MONITOR_STACK_SIZE];
+
+/* ---------- Static Queue Buffers ---------- */
+static StaticQueue_t xCmdQueueStatic;
+static uint8_t ucCmdQueueStorage[CMD_QUEUE_LENGTH * sizeof(char *)];
+
+/* ---------- Static Mutex ---------- */
+static StaticSemaphore_t xUartMutexStatic;
+
+/* ---------- Task Handles ---------- */
+static TaskHandle_t xUartRxTask;
+static TaskHandle_t xCommandTask;
+static TaskHandle_t xMonitorTaskHandle;
+
+/* ---------- RTOS Objects ---------- */
+static QueueHandle_t     xCmdQueue;
+static SemaphoreHandle_t xUartMutex;
+
+/* ---------- Memory Pool ---------- */
+static uint8_t pool_storage[POOL_BLOCK_COUNT][CMD_BUF_SIZE];
+static StaticQueue_t xPoolQueueStatic;
+static uint8_t ucPoolQueueStorage[POOL_BLOCK_COUNT * sizeof(void *)];
+static QueueHandle_t xPoolQueue;
+
+static void pool_init(void) {
+    xPoolQueue = xQueueCreateStatic(
+        POOL_BLOCK_COUNT, sizeof(void *),
+        ucPoolQueueStorage, &xPoolQueueStatic
+    );
+    for (int i = 0; i < POOL_BLOCK_COUNT; i++) {
+        void *ptr = &pool_storage[i][0];
+        xQueueSend(xPoolQueue, &ptr, 0);
+    }
+}
+
+static void *pool_alloc(TickType_t timeout) {
+    void *ptr = NULL;
+    if (xQueueReceive(xPoolQueue, &ptr, timeout) == pdPASS) {
+        return ptr;
+    }
+    return NULL;
+}
+
+static void pool_free(void *ptr) {
+    xQueueSend(xPoolQueue, &ptr, 0);
+}
+
+/* ---------- Stack Overflow Hook ---------- */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
+    (void)xTask;
+    ESP_LOGE(TAG, "STACK OVERFLOW: %s", pcTaskName);
+    abort();
+}
+
+/* ---------- LED Control ---------- */
+static void led_init(void) {
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 0);
+}
+
+static void led_on(void)  { gpio_set_level(LED_PIN, 1); }
+static void led_off(void) { gpio_set_level(LED_PIN, 0); }
+
+/* ---------- Thread-safe print ---------- */
+static void safe_print(const char *str) {
+    xSemaphoreTake(xUartMutex, portMAX_DELAY);
+    printf("%s", str);
+    xSemaphoreGive(xUartMutex);
+}
+
+/* ---------- Stack Overflow Demo ---------- */
+static volatile uint32_t recurse_depth = 0;
+
+static void stack_overflow_recurse(void) {
+    volatile uint8_t padding[64];
+    (void)padding;
+    recurse_depth++;
+    stack_overflow_recurse();
+}
+
+/* ---------- Stress Test ---------- */
+static void stress_test(void) {
+    char buf[80];
+    safe_print("Running memory stress test...\r\n");
+
+    void *blocks[POOL_BLOCK_COUNT];
+    int allocated = 0;
+
+    for (int i = 0; i < POOL_BLOCK_COUNT; i++) {
+        blocks[i] = pool_alloc(0);
+        if (blocks[i] != NULL) {
+            allocated++;
+            memset(blocks[i], 0xBB, CMD_BUF_SIZE);
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "  Allocated %d/%d pool blocks\r\n",
+             allocated, POOL_BLOCK_COUNT);
+    safe_print(buf);
+
+    void *extra = pool_alloc(0);
+    if (extra == NULL) {
+        safe_print("  Extra alloc correctly failed (pool exhausted)\r\n");
+    }
+
+    for (int i = 0; i < allocated / 2; i++) {
+        pool_free(blocks[i]);
+        blocks[i] = NULL;
+    }
+
+    snprintf(buf, sizeof(buf), "  Freed %d blocks, re-allocating...\r\n",
+             allocated / 2);
+    safe_print(buf);
+
+    int reallocated = 0;
+    for (int i = 0; i < allocated / 2; i++) {
+        blocks[i] = pool_alloc(0);
+        if (blocks[i] != NULL) reallocated++;
+    }
+
+    snprintf(buf, sizeof(buf), "  Re-allocated %d blocks (zero fragmentation)\r\n",
+             reallocated);
+    safe_print(buf);
+
+    for (int i = 0; i < POOL_BLOCK_COUNT; i++) {
+        if (blocks[i] != NULL) pool_free(blocks[i]);
+    }
+
+    safe_print("  Stress test complete. All blocks returned.\r\n");
+}
+
+/* ---------- Print Status ---------- */
+static void print_status(void) {
+    char buf[80];
+
+    safe_print("\r\n--- System Status ---\r\n");
+
+    TaskHandle_t tasks[] = {xUartRxTask, xCommandTask, xMonitorTaskHandle};
+    const char *names[]  = {"UartRx", "Command", "Monitor"};
+
+    for (int i = 0; i < 3; i++) {
+        if (tasks[i] != NULL) {
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(tasks[i]);
+            snprintf(buf, sizeof(buf), "  %-10s : %u words free\r\n",
+                     names[i], (unsigned)hwm);
+            safe_print(buf);
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "  Heap free  : %u bytes\r\n",
+             (unsigned)xPortGetFreeHeapSize());
+    safe_print(buf);
+
+    snprintf(buf, sizeof(buf), "  Heap min   : %u bytes\r\n",
+             (unsigned)xPortGetMinimumEverFreeHeapSize());
+    safe_print(buf);
+
+    UBaseType_t pool_avail = uxQueueMessagesWaiting(xPoolQueue);
+    snprintf(buf, sizeof(buf), "  Pool avail : %u/%d blocks\r\n",
+             (unsigned)pool_avail, POOL_BLOCK_COUNT);
+    safe_print(buf);
+}
+
+/* ---------- UART Receive Task ---------- */
+static void vUartRxTaskFn(void *pvParameters) {
+    (void)pvParameters;
+    char *cmd_buf = NULL;
+    uint8_t idx = 0;
+    uint8_t c;
+
+    for (;;) {
+        int len = uart_read_bytes(UART_NUM, &c, 1, portMAX_DELAY);
+        if (len > 0) {
+            /* Echo */
+            xSemaphoreTake(xUartMutex, portMAX_DELAY);
+            printf("%c", c);
+            xSemaphoreGive(xUartMutex);
+
+            if (cmd_buf == NULL) {
+                cmd_buf = (char *)pool_alloc(pdMS_TO_TICKS(100));
+                if (cmd_buf == NULL) {
+                    safe_print("\r\n[Pool exhausted]\r\n");
+                    continue;
+                }
+                idx = 0;
+            }
+
+            if (c == '\r' || c == '\n') {
+                if (idx > 0) {
+                    cmd_buf[idx] = '\0';
+                    if (xQueueSend(xCmdQueue, &cmd_buf, pdMS_TO_TICKS(100)) != pdPASS) {
+                        safe_print("\r\n[Cmd queue full]\r\n");
+                        pool_free(cmd_buf);
+                    }
+                    cmd_buf = NULL;
+                    idx = 0;
+                    safe_print("\r\n");
+                }
+            } else if (idx < CMD_BUF_SIZE - 1) {
+                cmd_buf[idx++] = c;
+            }
+        }
+    }
+}
+
+/* ---------- Command Task ---------- */
+static void vCommandTaskFn(void *pvParameters) {
+    (void)pvParameters;
+    char *cmd;
+
+    for (;;) {
+        if (xQueueReceive(xCmdQueue, &cmd, portMAX_DELAY) == pdPASS) {
+            if (strcmp(cmd, "led on") == 0) {
+                led_on();
+                safe_print("LED on\r\n");
+            } else if (strcmp(cmd, "led off") == 0) {
+                led_off();
+                safe_print("LED off\r\n");
+            } else if (strcmp(cmd, "status") == 0) {
+                print_status();
+            } else if (strcmp(cmd, "stress") == 0) {
+                stress_test();
+            } else if (strcmp(cmd, "overflow") == 0) {
+                safe_print("Triggering stack overflow...\r\n");
+                recurse_depth = 0;
+                stack_overflow_recurse();
+            } else {
+                safe_print("Unknown command: ");
+                safe_print(cmd);
+                safe_print("\r\n");
+                safe_print("Commands: led on, led off, status, stress, overflow\r\n");
+            }
+
+            pool_free(cmd);
+        }
+    }
+}
+
+/* ---------- Monitor Task ---------- */
+static void vMonitorTaskFn(void *pvParameters) {
+    (void)pvParameters;
+
+    for (;;) {
+        print_status();
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+/* ---------- Main ---------- */
+void app_main(void) {
+    /* UART configuration */
+    uart_config_t uart_config = {
+        .baud_rate  = 115200,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+    };
+    uart_param_config(UART_NUM, &uart_config);
+    uart_driver_install(UART_NUM, UART_BUF_SIZE, 0, 0, NULL, 0);
+
+    led_init();
+    pool_init();
+
+    /* Create static queue */
+    xCmdQueue = xQueueCreateStatic(
+        CMD_QUEUE_LENGTH, sizeof(char *),
+        ucCmdQueueStorage, &xCmdQueueStatic
+    );
+
+    /* Create static mutex */
+    xUartMutex = xSemaphoreCreateMutexStatic(&xUartMutexStatic);
+
+    /* Create static tasks */
+    xUartRxTask = xTaskCreateStatic(
+        vUartRxTaskFn, "UartRx", UART_RX_STACK_SIZE,
+        NULL, 2, xUartRxStack, &xUartRxTCB
+    );
+
+    xCommandTask = xTaskCreateStatic(
+        vCommandTaskFn, "Command", CMD_TASK_STACK_SIZE,
+        NULL, 2, xCmdTaskStack, &xCmdTaskTCB
+    );
+
+    xMonitorTaskHandle = xTaskCreateStatic(
+        vMonitorTaskFn, "Monitor", MONITOR_STACK_SIZE,
+        NULL, 1, xMonitorStack, &xMonitorTCB
+    );
+
+    ESP_LOGI(TAG, "Memory-Safe Command Processor started");
+    ESP_LOGI(TAG, "Commands: led on, led off, status, stress, overflow");
+
+    /* ESP-IDF scheduler is already running; app_main can return */
+}
+```
+
+Note the ESP32 differences: stack sizes are much larger (ESP32 tasks typically need 2048+ bytes), the UART driver is provided by ESP-IDF rather than bare-metal register access, and `app_main` returns normally because the ESP-IDF scheduler starts before `app_main` is called. The `vApplicationGetIdleTaskMemory` and `vApplicationGetTimerTaskMemory` callbacks are not needed because ESP-IDF handles idle and timer task allocation internally.
+
+</TabItem>
+</Tabs>
+
+### Data Flow
+
+```
+┌──────────────┐  char *ptr  ┌──────────────┐
+│  UartRx      │────────────>│  Command      │
+│  (assembles  │  xCmdQueue  │  (parses and  │
+│   commands)  │  depth = 8  │   executes)   │
+│  Priority 2  │             │  Priority 2   │
+└──────┬───────┘             └──────┬────────┘
+       │                            │
+       │  pool_alloc()              │  pool_free()
+       v                            v
+┌──────────────────────────────────────────┐
+│            Memory Pool (8 x 64 bytes)    │
+│  Queue of pointers: take = alloc,        │
+│                     give = free           │
+└──────────────────────────────────────────┘
+
+┌──────────────┐
+│  Monitor     │  Prints stack watermarks and
+│  (periodic)  │  heap statistics every 5 seconds
+│  Priority 1  │
+└──────────────┘
+```
+
+The UartRx task allocates a buffer from the pool when the first character of a new command arrives. Once the command is complete (newline received), the buffer pointer is sent through `xCmdQueue`. The Command task receives the pointer, processes the command, and returns the buffer to the pool. Ownership of each buffer is always clear: exactly one task holds a reference at any time.
+
+## Project Structure
+
+<InArticleAd />
+
+
+<FileTree>
+- memory-safe-cmdproc/
+  - src/
+    - main.c
+    - uart.c
+    - uart.h
+    - clock.c
+    - clock.h
+  - include/
+    - FreeRTOSConfig.h
+  - Makefile
+  - platformio.ini
+</FileTree>
+
+### FreeRTOSConfig.h Key Settings
+
+These settings must be present for static allocation, stack monitoring, and overflow detection:
+
+```c
+/* FreeRTOSConfig.h */
+#define configUSE_PREEMPTION                    1
+#define configTICK_RATE_HZ                      1000
+#define configMAX_PRIORITIES                    5
+#define configMINIMAL_STACK_SIZE                128
+#define configTOTAL_HEAP_SIZE                   ((size_t)(4 * 1024))
+
+/* Static allocation (the core of this lesson) */
+#define configSUPPORT_STATIC_ALLOCATION         1
+#define configSUPPORT_DYNAMIC_ALLOCATION        1  /* Keep for heap stats demo */
+
+/* Stack overflow detection: Method 2 (pattern check) */
+#define configCHECK_FOR_STACK_OVERFLOW          2
+
+/* Task state query (for vTaskList) */
+#define configUSE_TRACE_FACILITY                1
+#define configUSE_STATS_FORMATTING_FUNCTIONS    1
+
+/* Software timers (needed for timer task memory callback) */
+#define configUSE_TIMERS                        1
+#define configTIMER_TASK_STACK_DEPTH            128
+#define configTIMER_TASK_PRIORITY               3
+#define configTIMER_QUEUE_LENGTH                5
+```
+
+The total heap size is set to 4 KB. Since all tasks, queues, and the mutex are statically allocated, the heap is only used for the stress test demonstration. In a production system with `configSUPPORT_DYNAMIC_ALLOCATION` set to 0, you would not need the heap at all.
+
+### PlatformIO Configuration
+
+```ini
+; platformio.ini
+[env:bluepill]
+platform = ststm32
+board = bluepill_f103c8
+framework = stm32cube
+build_flags =
+    -DUSE_HAL_DRIVER
+    -DSTM32F103xB
+
+[env:esp32]
+platform = espressif32
+board = esp32dev
+framework = espidf
+```
+
+## Experiments
+
+<InArticleAd />
+
+
+<CardGrid>
+  <Card title="Switch Heap Schemes and Compare" icon="star">
+    Build the project four times, linking heap_1, heap_2, heap_4, and heap_5 in turn. Run the "stress" command with each scheme. With heap_1 the stress test will fail (free is a no-op). With heap_2 and heap_4, compare the free heap reported after the stress cycle. Log your findings and note which scheme recovers all the memory.
+  </Card>
+
+  <Card title="Implement a Custom Allocator" icon="rocket">
+    Write a simple bump allocator that hands out memory from a fixed byte array, incrementing a pointer for each allocation and never freeing. Integrate it as a replacement for pvPortMalloc by defining your own pvPortMalloc and vPortFree functions. Measure how much faster it is than heap_4 by timing 1000 allocations.
+  </Card>
+
+  <Card title="Add a Memory Leak Detector" icon="setting">
+    Modify the pool allocator to track which task allocated each block (store the task handle alongside the pointer). In the monitor task, print any blocks that have been held for longer than 10 seconds. This simulates a simple leak detector that identifies tasks holding resources too long.
+  </Card>
+
+  <Card title="Tune Stack Sizes with Watermarks" icon="open-book">
+    Start every task with a generous stack (512 words). Run all commands including "stress". Check the high-water marks from the "status" output. Reduce each task's stack to its measured peak usage plus a 30% margin. Rebuild and verify no overflows occur. Document the before and after SRAM usage.
+  </Card>
+</CardGrid>
+
+:::tip[Next Lesson]
+In [Lesson 6: Software Timers and Interrupt Management](/education/rtos-programming/software-timers-interrupt-management), you will learn how to schedule periodic and one-shot callbacks without creating dedicated tasks. You will also integrate hardware interrupts with FreeRTOS using deferred interrupt processing, where an ISR signals a task through a semaphore or direct-to-task notification and the task handles the actual work.
+:::
+
+<RtosProgrammingComments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />

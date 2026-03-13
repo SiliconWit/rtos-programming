@@ -1,0 +1,1113 @@
+---
+title: "Queues and Inter-Task Communication"
+description: "Build a sensor data pipeline using FreeRTOS queues: a producer task reads ADC values, a filter task smooths the data, and a consumer task displays results on an OLED. Learn message queues, stream buffers, event groups, and producer-consumer patterns."
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-02-07
+tags: ["rtos", "freertos", "queues", "ipc", "producer-consumer", "event-groups"]
+excerpt: "Create a three-stage sensor pipeline where FreeRTOS queues carry data from an ADC producer through a moving-average filter to an OLED display consumer. Experiment with queue sizing, blocking behavior, and event groups to coordinate the stages."
+heroImage: "https://cdn.siliconwit.com/education/rtos-programming/Real-Time-Operating-System-RTOS.jpeg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import RtosProgrammingComments from '../../../../components/rtos-programming/RtosProgrammingComments.astro';
+
+Tasks that run in isolation are rarely useful. Real embedded systems need tasks that exchange data: a sensor reader passes measurements to a filter, the filter passes cleaned values to a display, and each stage runs at its own pace without losing samples. FreeRTOS queues make this possible by providing thread-safe, fixed-size channels between tasks. In this lesson you will build a three-stage sensor pipeline where a potentiometer reading flows through an ADC producer, a moving-average filter, and finally onto an SSD1306 OLED display, all coordinated through queues and event groups. #FreeRTOS #Queues #ProducerConsumer
+
+## What We Are Building
+
+<Card title="Sensor Data Pipeline" icon="star">
+A producer task samples a potentiometer via ADC at 100 Hz and pushes raw readings into a queue. A filter task pulls from that queue, applies a moving-average window, and pushes smoothed values into a second queue. A consumer task reads filtered values and renders a live bar graph on an SSD1306 OLED. Event groups signal when new data is ready so tasks only wake when they have work to do.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| MCU | STM32 Blue Pill or ESP32 DevKit |
+| RTOS | FreeRTOS |
+| Pipeline stages | 3 (ADC producer, filter, OLED consumer) |
+| Sample rate | 100 Hz (10 ms period) |
+| Queue depth | 16 items per queue |
+| Filter type | Moving average, window size 8 |
+| Display | SSD1306 128x64 OLED (I2C) |
+| Sensor input | Potentiometer on ADC channel |
+
+### Parts List
+
+| Ref | Component | Quantity | Notes |
+|-----|-----------|----------|-------|
+| U1 | STM32 Blue Pill or ESP32 DevKit | 1 | Reuse from prior courses |
+| U2 | SSD1306 OLED 128x64 (I2C) | 1 | Reuse from prior courses |
+| R1 | 10k potentiometer | 1 | ADC input source |
+| - | Breadboard and jumper wires | 1 set | For prototyping |
+
+## Why Not Global Variables?
+
+<InArticleAd />
+
+
+The simplest way to share data between two tasks is a global variable. It is also the most dangerous. Consider two tasks that both increment a shared counter:
+
+```c
+volatile uint32_t shared_counter = 0;
+
+void vTaskA(void *pvParameters) {
+    for (;;) {
+        shared_counter++;   /* Read, modify, write */
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void vTaskB(void *pvParameters) {
+    for (;;) {
+        shared_counter++;   /* Read, modify, write */
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+```
+
+The `shared_counter++` statement compiles to three separate instructions on ARM: load the value from memory, add one, store the result back. If the RTOS scheduler preempts Task A between the load and the store, Task B reads the old value, increments it, and writes it back. When Task A resumes, it writes back its stale copy, overwriting Task B's increment entirely. After 10,000 iterations from each task you might see a counter of 15,000 instead of 20,000.
+
+This is a **race condition**. The `volatile` keyword does not fix it because volatile only prevents the compiler from caching the variable in a register; it does nothing about preemption between the load and store instructions. Disabling interrupts around every access would work but kills real-time responsiveness. FreeRTOS provides better tools: queues for passing data, and semaphores/mutexes (covered in Lesson 4) for protecting shared state.
+
+## FreeRTOS Queues
+
+<InArticleAd />
+
+
+A FreeRTOS queue is a fixed-size FIFO (first in, first out) buffer managed by the kernel. Tasks push items in at one end and pull them out at the other. The kernel handles all synchronization internally, so you never need to disable interrupts or guard access yourself.
+
+### Key Properties
+
+| Property | Detail |
+|----------|--------|
+| Fixed depth | Set at creation time, cannot be resized |
+| Fixed item size | Every slot holds the same number of bytes |
+| Copy semantics | Data is copied into the queue on send and copied out on receive. The original variable can be reused immediately |
+| Thread-safe | Send and receive are atomic from the caller's perspective |
+| Blocking | A task can block (sleep) until space is available or data arrives |
+
+### Creating a Queue
+
+```c
+QueueHandle_t xQueue;
+
+/* Create a queue that holds 16 items, each sizeof(uint16_t) bytes */
+xQueue = xQueueCreate(16, sizeof(uint16_t));
+
+if (xQueue == NULL) {
+    /* Not enough heap memory for the queue */
+    for (;;);  /* Halt or handle error */
+}
+```
+
+The `xQueueCreate` call allocates memory for the queue structure plus `depth * item_size` bytes of storage from the FreeRTOS heap. If your item is a large struct, consider queuing a pointer instead (but then you must ensure the pointed-to memory stays valid until the receiver reads it).
+
+### Sending to a Queue
+
+```c
+uint16_t adc_reading = 2048;
+
+/* Block forever until space is available */
+xQueueSend(xQueue, &adc_reading, portMAX_DELAY);
+
+/* Block for at most 100 ms */
+if (xQueueSend(xQueue, &adc_reading, pdMS_TO_TICKS(100)) != pdPASS) {
+    /* Queue was still full after 100 ms */
+    missed_samples++;
+}
+
+/* Non-blocking: return immediately if full */
+if (xQueueSend(xQueue, &adc_reading, 0) != pdPASS) {
+    /* Queue is full right now */
+}
+```
+
+The third parameter is the **block time** in ticks. Setting it to `portMAX_DELAY` means the calling task sleeps until a slot opens. Setting it to `0` means try once and return immediately. Any value in between is a timeout.
+
+### Receiving from a Queue
+
+```c
+uint16_t received_value;
+
+/* Block until data arrives */
+if (xQueueReceive(xQueue, &received_value, portMAX_DELAY) == pdPASS) {
+    /* received_value now contains the oldest item from the queue */
+}
+```
+
+`xQueueReceive` removes the item from the queue. If you want to look at the front item without removing it, use `xQueuePeek` instead. This is useful when one consumer needs to inspect data before deciding whether to process it.
+
+## Producer-Consumer Pattern
+
+<InArticleAd />
+
+
+The producer-consumer pattern is the most common use of queues. One task generates data, another task processes it, and the queue sits between them as a buffer. Neither task needs to know the other's timing. If the producer runs faster than the consumer, the queue absorbs bursts. If the consumer runs faster, it simply blocks until more data arrives.
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐
+│ Producer │───>│  Queue   │───>│ Consumer │
+│ (ADC)    │    │ (FIFO)   │    │ (Filter) │
+└──────────┘    └──────────┘    └──────────┘
+```
+
+A minimal example:
+
+```c
+QueueHandle_t xDataQueue;
+
+void vProducerTask(void *pvParameters) {
+    uint16_t value = 0;
+    for (;;) {
+        value = read_adc();  /* Produce a value */
+        xQueueSend(xDataQueue, &value, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(10));  /* 100 Hz */
+    }
+}
+
+void vConsumerTask(void *pvParameters) {
+    uint16_t received;
+    for (;;) {
+        if (xQueueReceive(xDataQueue, &received, portMAX_DELAY) == pdPASS) {
+            process(received);  /* Consume the value */
+        }
+    }
+}
+```
+
+The consumer has no `vTaskDelay` because `xQueueReceive` with `portMAX_DELAY` already puts the task to sleep when the queue is empty. The task wakes exactly when new data arrives.
+
+## Queue Sizing
+
+<InArticleAd />
+
+
+Choosing the right queue depth is a design decision, not a guess. Too shallow and you lose data during bursts. Too deep and you waste RAM and add latency.
+
+### Rules of Thumb
+
+| Scenario | Recommended depth |
+|----------|-------------------|
+| Producer and consumer run at the same average rate | 2 to 4 items (just smoothing jitter) |
+| Producer has periodic bursts | Burst size + small margin |
+| Consumer occasionally stalls (display update, flash write) | Stall duration / producer period |
+| Memory is very tight | 1 (pure synchronization, no buffering) |
+
+### What Happens on Overflow
+
+The behavior depends entirely on the timeout you pass to `xQueueSend`:
+
+```c
+/* Strategy 1: Block forever. Producer waits until consumer catches up. */
+/* Risk: if the consumer is dead, the producer hangs too. */
+xQueueSend(xQueue, &val, portMAX_DELAY);
+
+/* Strategy 2: Bounded wait. Producer drops old work after timeout. */
+if (xQueueSend(xQueue, &val, pdMS_TO_TICKS(50)) != pdPASS) {
+    overflow_count++;
+    /* Log it, skip this sample, or overwrite the oldest item */
+}
+
+/* Strategy 3: Non-blocking. Best for ISR contexts or real-time loops. */
+if (xQueueSend(xQueue, &val, 0) != pdPASS) {
+    overflow_count++;
+}
+```
+
+For the sensor pipeline in this lesson, we use a depth of 16 with a bounded timeout. If the filter task falls behind by more than 160 ms worth of samples (16 items at 10 ms each), the producer logs a miss and keeps running.
+
+### Overwrite Mode
+
+FreeRTOS also provides `xQueueOverwrite`, which works only on queues of depth 1. It always writes the latest value, overwriting whatever was there. This is useful for "latest value" patterns where you always want the most recent sensor reading and never need history.
+
+## Stream Buffers and Message Buffers
+
+<InArticleAd />
+
+
+Queues are ideal when every item has the same size. For variable-length data, FreeRTOS provides two alternatives introduced in version 10.
+
+### Stream Buffers
+
+A stream buffer is a byte-level FIFO, similar to a UART receive ring buffer. It has no concept of discrete messages; the reader pulls however many bytes it wants. This makes stream buffers efficient for forwarding raw byte streams, like UART data from a GPS module or a serial console.
+
+```c
+StreamBufferHandle_t xStream;
+
+/* 256-byte buffer, trigger level = 1 byte */
+xStream = xStreamBufferCreate(256, 1);
+
+/* Writer (e.g., UART ISR) */
+xStreamBufferSendFromISR(xStream, uart_data, len, &xHigherPriorityWoken);
+
+/* Reader task */
+size_t bytes_read = xStreamBufferReceive(xStream, buf, sizeof(buf),
+                                          pdMS_TO_TICKS(100));
+```
+
+The **trigger level** sets the minimum number of bytes that must be in the buffer before a blocked reader wakes up. A trigger of 1 means wake on the first byte. A trigger of 64 means wait until at least 64 bytes are available, which reduces context switches for bulk transfers.
+
+### Message Buffers
+
+A message buffer wraps a stream buffer but adds a 4-byte length header before each message. This lets you send variable-length messages where the reader always gets one complete message at a time.
+
+```c
+MessageBufferHandle_t xMsgBuf;
+
+xMsgBuf = xMessageBufferCreate(512);
+
+/* Send a variable-length struct */
+xMessageBufferSend(xMsgBuf, &sensor_packet, sizeof(sensor_packet),
+                    portMAX_DELAY);
+
+/* Receive: returns the number of bytes in this message */
+size_t len = xMessageBufferReceive(xMsgBuf, rx_buf, sizeof(rx_buf),
+                                    portMAX_DELAY);
+```
+
+### When to Use Each
+
+| Mechanism | Item size | Best for |
+|-----------|-----------|----------|
+| Queue | Fixed | Sensor readings, commands, events |
+| Stream buffer | Byte stream | UART forwarding, audio samples, raw data |
+| Message buffer | Variable | Log entries, protocol packets, mixed-type messages |
+
+**Limitation:** Stream buffers and message buffers support only one writer and one reader. If you need multiple writers, use a queue or protect access with a mutex.
+
+## Event Groups
+
+<InArticleAd />
+
+
+Sometimes you do not need to pass data between tasks; you just need to signal that something happened. FreeRTOS event groups let multiple tasks set and wait on individual flag bits within a shared 24-bit (or 8-bit on small ports) word.
+
+### Creating and Using Event Groups
+
+```c
+#include "event_groups.h"
+
+#define EVT_RAW_DATA_READY     (1 << 0)
+#define EVT_FILTERED_READY     (1 << 1)
+#define EVT_DISPLAY_DONE       (1 << 2)
+
+EventGroupHandle_t xPipelineEvents;
+
+void setup_events(void) {
+    xPipelineEvents = xEventGroupCreate();
+}
+```
+
+### Setting Bits (Signaling)
+
+```c
+/* Producer signals that new raw data is in the queue */
+xEventGroupSetBits(xPipelineEvents, EVT_RAW_DATA_READY);
+```
+
+### Waiting for Bits
+
+```c
+/* Filter task waits until raw data is ready */
+EventBits_t bits = xEventGroupWaitBits(
+    xPipelineEvents,
+    EVT_RAW_DATA_READY,   /* Bits to wait for */
+    pdTRUE,                /* Clear the bit on exit */
+    pdFALSE,               /* Wait for ANY of the bits (not all) */
+    portMAX_DELAY          /* Block forever */
+);
+
+if (bits & EVT_RAW_DATA_READY) {
+    /* Process the data */
+}
+```
+
+The `pdTRUE` parameter means the kernel automatically clears the bit after the waiting task unblocks. This prevents stale signals. The `pdFALSE` parameter means wait for ANY of the specified bits. If you set it to `pdTRUE`, the task would wait until ALL specified bits are set, which is useful for synchronizing multiple conditions.
+
+### Multi-Task Synchronization
+
+Event groups shine when a task must wait for several conditions:
+
+```c
+/* Display task waits for BOTH filtered data AND a display-ready signal */
+EventBits_t bits = xEventGroupWaitBits(
+    xPipelineEvents,
+    EVT_FILTERED_READY | EVT_DISPLAY_DONE,
+    pdTRUE,
+    pdTRUE,                /* Wait for ALL bits */
+    pdMS_TO_TICKS(100)
+);
+```
+
+## Circuit Connections
+
+<InArticleAd />
+
+
+### STM32 Blue Pill Wiring
+
+| Signal | Blue Pill Pin | Peripheral |
+|--------|---------------|------------|
+| Potentiometer wiper | PA0 | ADC1 Channel 0 |
+| SSD1306 SDA | PB7 | I2C1 SDA |
+| SSD1306 SCL | PB6 | I2C1 SCL |
+| SSD1306 VCC | 3.3V | Power |
+| SSD1306 GND | GND | Ground |
+| Pot high side | 3.3V | Reference |
+| Pot low side | GND | Ground |
+
+### ESP32 DevKit Wiring
+
+| Signal | ESP32 Pin | Peripheral |
+|--------|-----------|------------|
+| Potentiometer wiper | GPIO34 | ADC1 Channel 6 |
+| SSD1306 SDA | GPIO21 | I2C SDA |
+| SSD1306 SCL | GPIO22 | I2C SCL |
+| SSD1306 VCC | 3.3V | Power |
+| SSD1306 GND | GND | Ground |
+| Pot high side | 3.3V | Reference |
+| Pot low side | GND | Ground |
+
+<Steps>
+1. Connect the potentiometer as a voltage divider: high side to 3.3V, low side to GND, wiper to the ADC pin.
+
+2. Connect the SSD1306 OLED module: SDA and SCL to the I2C pins, VCC to 3.3V, GND to GND. Most SSD1306 modules have onboard pull-ups, so external pull-ups are optional.
+
+3. Double-check that both the OLED and potentiometer share a common ground with the microcontroller.
+</Steps>
+
+## SSD1306 OLED Driver
+
+<InArticleAd />
+
+
+We need a minimal I2C driver for the SSD1306 to draw a bar graph. This is not a full graphics library; it handles initialization, clearing the display, drawing a filled rectangle (the bar), and writing a single line of text using a basic 5x7 font.
+
+### Minimal Driver Interface
+
+```c
+/* ssd1306.h */
+#ifndef SSD1306_H
+#define SSD1306_H
+
+#include <stdint.h>
+
+#define SSD1306_ADDR       0x3C
+#define SSD1306_WIDTH      128
+#define SSD1306_HEIGHT     64
+
+void ssd1306_init(void);
+void ssd1306_clear(void);
+void ssd1306_update(void);
+void ssd1306_draw_bar(uint8_t x, uint8_t width, uint8_t height);
+void ssd1306_draw_string(uint8_t x, uint8_t page, const char *str);
+
+#endif
+```
+
+### Driver Implementation
+
+```c
+/* ssd1306.c */
+#include "ssd1306.h"
+#include "i2c.h"
+#include <string.h>
+
+static uint8_t framebuffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
+
+/* Basic 5x7 font for digits 0-9, space, and a few useful characters */
+static const uint8_t font5x7[][5] = {
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 0 */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 1 */
+    {0x42,0x61,0x51,0x49,0x46}, /* 2 */
+    {0x21,0x41,0x45,0x4B,0x31}, /* 3 */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 4 */
+    {0x27,0x45,0x45,0x45,0x39}, /* 5 */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* 6 */
+    {0x01,0x71,0x09,0x05,0x03}, /* 7 */
+    {0x36,0x49,0x49,0x49,0x36}, /* 8 */
+    {0x06,0x49,0x49,0x29,0x1E}, /* 9 */
+    {0x00,0x00,0x00,0x00,0x00}, /* space */
+};
+
+static void ssd1306_cmd(uint8_t cmd) {
+    uint8_t buf[2] = {0x00, cmd};  /* Co=0, D/C=0 */
+    i2c_write(SSD1306_ADDR, buf, 2);
+}
+
+void ssd1306_init(void) {
+    /* Startup delay for power stabilization */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    ssd1306_cmd(0xAE);  /* Display off */
+    ssd1306_cmd(0xD5);  /* Set display clock */
+    ssd1306_cmd(0x80);
+    ssd1306_cmd(0xA8);  /* Set multiplex ratio */
+    ssd1306_cmd(0x3F);  /* 64 lines */
+    ssd1306_cmd(0xD3);  /* Set display offset */
+    ssd1306_cmd(0x00);
+    ssd1306_cmd(0x40);  /* Set start line 0 */
+    ssd1306_cmd(0x8D);  /* Charge pump */
+    ssd1306_cmd(0x14);  /* Enable charge pump */
+    ssd1306_cmd(0x20);  /* Memory addressing mode */
+    ssd1306_cmd(0x00);  /* Horizontal addressing */
+    ssd1306_cmd(0xA1);  /* Segment remap */
+    ssd1306_cmd(0xC8);  /* COM scan direction */
+    ssd1306_cmd(0xDA);  /* COM pins config */
+    ssd1306_cmd(0x12);
+    ssd1306_cmd(0x81);  /* Set contrast */
+    ssd1306_cmd(0xCF);
+    ssd1306_cmd(0xD9);  /* Pre-charge period */
+    ssd1306_cmd(0xF1);
+    ssd1306_cmd(0xDB);  /* VCOMH deselect level */
+    ssd1306_cmd(0x40);
+    ssd1306_cmd(0xA4);  /* Resume from RAM */
+    ssd1306_cmd(0xA6);  /* Normal display (not inverted) */
+    ssd1306_cmd(0xAF);  /* Display on */
+
+    ssd1306_clear();
+    ssd1306_update();
+}
+
+void ssd1306_clear(void) {
+    memset(framebuffer, 0, sizeof(framebuffer));
+}
+
+void ssd1306_update(void) {
+    ssd1306_cmd(0x21);  /* Column address range */
+    ssd1306_cmd(0);
+    ssd1306_cmd(127);
+    ssd1306_cmd(0x22);  /* Page address range */
+    ssd1306_cmd(0);
+    ssd1306_cmd(7);
+
+    /* Send framebuffer in 16-byte chunks */
+    for (uint16_t i = 0; i < sizeof(framebuffer); i += 16) {
+        uint8_t buf[17];
+        buf[0] = 0x40;  /* Co=0, D/C=1 (data) */
+        memcpy(&buf[1], &framebuffer[i], 16);
+        i2c_write(SSD1306_ADDR, buf, 17);
+    }
+}
+
+void ssd1306_draw_bar(uint8_t x, uint8_t width, uint8_t height) {
+    /* Draw a filled bar from the bottom of the display upward. */
+    /* height is in pixels (0 to 64). */
+    if (height > SSD1306_HEIGHT) height = SSD1306_HEIGHT;
+
+    for (uint8_t col = x; col < x + width && col < SSD1306_WIDTH; col++) {
+        for (uint8_t row = SSD1306_HEIGHT - height; row < SSD1306_HEIGHT; row++) {
+            uint8_t page = row / 8;
+            uint8_t bit  = row % 8;
+            framebuffer[page * SSD1306_WIDTH + col] |= (1 << bit);
+        }
+    }
+}
+
+void ssd1306_draw_string(uint8_t x, uint8_t page, const char *str) {
+    while (*str && x < SSD1306_WIDTH - 5) {
+        uint8_t idx;
+        if (*str >= '0' && *str <= '9') {
+            idx = *str - '0';
+        } else {
+            idx = 10;  /* space / unknown */
+        }
+        for (uint8_t col = 0; col < 5; col++) {
+            framebuffer[page * SSD1306_WIDTH + x + col] = font5x7[idx][col];
+        }
+        x += 6;  /* 5 pixels + 1 pixel gap */
+        str++;
+    }
+}
+```
+
+For a more complete driver (full ASCII font, graphics primitives), the popular `ssd1306` library by Aleksei Loginov works well with both STM32 and ESP32. The minimal version above keeps the focus on FreeRTOS queues rather than display code.
+
+## Complete Sensor Pipeline
+
+<InArticleAd />
+
+
+This is the full application. Three tasks communicate through two queues and an event group. The producer reads the ADC at 100 Hz, the filter computes an 8-sample moving average, and the display task renders a bar graph at roughly 20 Hz. Serial output logs queue fill levels so you can see the pipeline in action.
+
+<Tabs>
+<TabItem label="STM32 Blue Pill">
+
+```c
+/* main.c - Sensor Pipeline on STM32 Blue Pill with FreeRTOS */
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "event_groups.h"
+
+#include "stm32f1xx.h"
+#include "clock.h"
+#include "uart.h"
+#include "i2c.h"
+#include "ssd1306.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/* ---------- Configuration ---------- */
+#define QUEUE_DEPTH        16
+#define FILTER_WINDOW      8
+#define SAMPLE_PERIOD_MS   10    /* 100 Hz */
+#define DISPLAY_PERIOD_MS  50    /* 20 Hz */
+
+/* Event group bits */
+#define EVT_RAW_READY      (1 << 0)
+#define EVT_FILTERED_READY (1 << 1)
+
+/* ---------- Globals ---------- */
+static QueueHandle_t      queue_raw;
+static QueueHandle_t      queue_filtered;
+static EventGroupHandle_t xPipelineEvents;
+
+static volatile uint32_t  missed_raw = 0;
+static volatile uint32_t  missed_filtered = 0;
+
+/* ---------- ADC Setup (PA0, single conversion) ---------- */
+static void adc_init(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN | RCC_APB2ENR_IOPAEN;
+
+    /* ADC clock: 72 MHz / 6 = 12 MHz */
+    RCC->CFGR &= ~RCC_CFGR_ADCPRE;
+    RCC->CFGR |= RCC_CFGR_ADCPRE_DIV6;
+
+    /* PA0 as analog input */
+    GPIOA->CRL &= ~(0xF << 0);
+
+    ADC1->CR2 = ADC_CR2_ADON;
+    for (volatile int i = 0; i < 10000; i++);
+
+    /* Single channel, single conversion */
+    ADC1->SQR1 = 0;           /* 1 conversion */
+    ADC1->SQR3 = 0;           /* Channel 0 */
+    ADC1->SMPR2 = (0x7 << 0); /* 239.5 cycles sample time */
+
+    /* Calibrate */
+    ADC1->CR2 |= ADC_CR2_RSTCAL;
+    while (ADC1->CR2 & ADC_CR2_RSTCAL);
+    ADC1->CR2 |= ADC_CR2_CAL;
+    while (ADC1->CR2 & ADC_CR2_CAL);
+}
+
+static uint16_t adc_read(void) {
+    ADC1->CR2 |= ADC_CR2_ADON;          /* Start conversion */
+    while (!(ADC1->SR & ADC_SR_EOC));    /* Wait for completion */
+    return (uint16_t)ADC1->DR;
+}
+
+/* ---------- Producer Task (Priority 2) ---------- */
+static void vProducerTask(void *pvParameters) {
+    TickType_t xLastWake = xTaskGetTickCount();
+    uint16_t sample;
+
+    for (;;) {
+        sample = adc_read();
+
+        if (xQueueSend(queue_raw, &sample, pdMS_TO_TICKS(5)) != pdPASS) {
+            missed_raw++;
+        } else {
+            xEventGroupSetBits(xPipelineEvents, EVT_RAW_READY);
+        }
+
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+    }
+}
+
+/* ---------- Filter Task (Priority 2) ---------- */
+static void vFilterTask(void *pvParameters) {
+    uint16_t window[FILTER_WINDOW];
+    uint8_t  idx = 0;
+    uint8_t  filled = 0;
+    uint16_t raw_val;
+    uint16_t avg;
+
+    memset(window, 0, sizeof(window));
+
+    for (;;) {
+        /* Wait for signal that raw data is available */
+        xEventGroupWaitBits(xPipelineEvents, EVT_RAW_READY,
+                            pdTRUE, pdFALSE, portMAX_DELAY);
+
+        /* Drain all available items from queue_raw */
+        while (xQueueReceive(queue_raw, &raw_val, 0) == pdPASS) {
+            window[idx] = raw_val;
+            idx = (idx + 1) % FILTER_WINDOW;
+            if (filled < FILTER_WINDOW) filled++;
+
+            /* Compute moving average */
+            uint32_t sum = 0;
+            for (uint8_t i = 0; i < filled; i++) {
+                sum += window[i];
+            }
+            avg = (uint16_t)(sum / filled);
+
+            if (xQueueSend(queue_filtered, &avg, pdMS_TO_TICKS(5)) != pdPASS) {
+                missed_filtered++;
+            } else {
+                xEventGroupSetBits(xPipelineEvents, EVT_FILTERED_READY);
+            }
+        }
+    }
+}
+
+/* ---------- Display Task (Priority 1) ---------- */
+static void vDisplayTask(void *pvParameters) {
+    TickType_t xLastWake = xTaskGetTickCount();
+    uint16_t filtered_val = 0;
+    char text_buf[16];
+
+    ssd1306_init();
+
+    for (;;) {
+        /* Wait for filtered data signal, but also wake on timeout for refresh */
+        xEventGroupWaitBits(xPipelineEvents, EVT_FILTERED_READY,
+                            pdTRUE, pdFALSE,
+                            pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+
+        /* Read the latest filtered value (drain queue, keep last) */
+        uint16_t temp;
+        while (xQueueReceive(queue_filtered, &temp, 0) == pdPASS) {
+            filtered_val = temp;
+        }
+
+        /* Scale ADC value (0-4095) to bar height (0-48 pixels) */
+        uint8_t bar_height = (uint8_t)((uint32_t)filtered_val * 48 / 4095);
+
+        /* Draw bar graph */
+        ssd1306_clear();
+        ssd1306_draw_bar(10, 40, bar_height);
+
+        /* Draw numeric value on the right side (page 3, roughly mid-screen) */
+        snprintf(text_buf, sizeof(text_buf), "%u", filtered_val);
+        ssd1306_draw_string(60, 3, text_buf);
+
+        ssd1306_update();
+
+        /* Serial logging: queue fill levels */
+        UBaseType_t raw_fill = uxQueueMessagesWaiting(queue_raw);
+        UBaseType_t filt_fill = uxQueueMessagesWaiting(queue_filtered);
+
+        snprintf(text_buf, sizeof(text_buf), "%u", filtered_val);
+        uart_send_string("ADC:");
+        uart_send_string(text_buf);
+
+        snprintf(text_buf, sizeof(text_buf), " Q0:%u", (unsigned)raw_fill);
+        uart_send_string(text_buf);
+
+        snprintf(text_buf, sizeof(text_buf), " Q1:%u", (unsigned)filt_fill);
+        uart_send_string(text_buf);
+
+        snprintf(text_buf, sizeof(text_buf), " miss:%lu/%lu",
+                 (unsigned long)missed_raw, (unsigned long)missed_filtered);
+        uart_send_string(text_buf);
+        uart_send_string("\r\n");
+
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+    }
+}
+
+/* ---------- Main ---------- */
+int main(void) {
+    clock_init();
+    uart_init();
+    i2c_init();
+    adc_init();
+
+    /* Create queues */
+    queue_raw      = xQueueCreate(QUEUE_DEPTH, sizeof(uint16_t));
+    queue_filtered = xQueueCreate(QUEUE_DEPTH, sizeof(uint16_t));
+    xPipelineEvents = xEventGroupCreate();
+
+    if (queue_raw == NULL || queue_filtered == NULL
+        || xPipelineEvents == NULL) {
+        uart_send_string("Failed to create RTOS objects\r\n");
+        for (;;);
+    }
+
+    /* Create tasks */
+    xTaskCreate(vProducerTask, "Producer", 256, NULL, 2, NULL);
+    xTaskCreate(vFilterTask,   "Filter",   256, NULL, 2, NULL);
+    xTaskCreate(vDisplayTask,  "Display",  512, NULL, 1, NULL);
+
+    uart_send_string("=== Sensor Pipeline Started ===\r\n");
+    vTaskStartScheduler();
+
+    for (;;);  /* Should never reach here */
+}
+```
+
+</TabItem>
+<TabItem label="ESP32 DevKit">
+
+```c
+/* main.c - Sensor Pipeline on ESP32 with FreeRTOS (ESP-IDF) */
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/event_groups.h"
+
+#include "driver/adc.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "ssd1306.h"
+
+#include <stdio.h>
+#include <string.h>
+
+static const char *TAG = "pipeline";
+
+/* ---------- Configuration ---------- */
+#define QUEUE_DEPTH        16
+#define FILTER_WINDOW      8
+#define SAMPLE_PERIOD_MS   10    /* 100 Hz */
+#define DISPLAY_PERIOD_MS  50    /* 20 Hz */
+
+#define EVT_RAW_READY      (1 << 0)
+#define EVT_FILTERED_READY (1 << 1)
+
+/* ---------- Globals ---------- */
+static QueueHandle_t      queue_raw;
+static QueueHandle_t      queue_filtered;
+static EventGroupHandle_t xPipelineEvents;
+
+static volatile uint32_t  missed_raw = 0;
+static volatile uint32_t  missed_filtered = 0;
+
+/* ---------- ADC Setup ---------- */
+static void adc_setup(void) {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
+}
+
+static uint16_t adc_read_pot(void) {
+    return (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
+}
+
+/* ---------- I2C Setup ---------- */
+static void i2c_setup(void) {
+    i2c_config_t conf = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = 21,
+        .scl_io_num       = 22,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 400000,
+    };
+    i2c_param_config(I2C_NUM_0, &conf);
+    i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+}
+
+/* ---------- Producer Task (Priority 2) ---------- */
+static void vProducerTask(void *pvParameters) {
+    TickType_t xLastWake = xTaskGetTickCount();
+    uint16_t sample;
+
+    for (;;) {
+        sample = adc_read_pot();
+
+        if (xQueueSend(queue_raw, &sample, pdMS_TO_TICKS(5)) != pdPASS) {
+            missed_raw++;
+        } else {
+            xEventGroupSetBits(xPipelineEvents, EVT_RAW_READY);
+        }
+
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+    }
+}
+
+/* ---------- Filter Task (Priority 2) ---------- */
+static void vFilterTask(void *pvParameters) {
+    uint16_t window[FILTER_WINDOW];
+    uint8_t  idx = 0;
+    uint8_t  filled = 0;
+    uint16_t raw_val;
+    uint16_t avg;
+
+    memset(window, 0, sizeof(window));
+
+    for (;;) {
+        xEventGroupWaitBits(xPipelineEvents, EVT_RAW_READY,
+                            pdTRUE, pdFALSE, portMAX_DELAY);
+
+        while (xQueueReceive(queue_raw, &raw_val, 0) == pdPASS) {
+            window[idx] = raw_val;
+            idx = (idx + 1) % FILTER_WINDOW;
+            if (filled < FILTER_WINDOW) filled++;
+
+            uint32_t sum = 0;
+            for (uint8_t i = 0; i < filled; i++) {
+                sum += window[i];
+            }
+            avg = (uint16_t)(sum / filled);
+
+            if (xQueueSend(queue_filtered, &avg, pdMS_TO_TICKS(5)) != pdPASS) {
+                missed_filtered++;
+            } else {
+                xEventGroupSetBits(xPipelineEvents, EVT_FILTERED_READY);
+            }
+        }
+    }
+}
+
+/* ---------- Display Task (Priority 1) ---------- */
+static void vDisplayTask(void *pvParameters) {
+    TickType_t xLastWake = xTaskGetTickCount();
+    uint16_t filtered_val = 0;
+
+    ssd1306_init();
+
+    for (;;) {
+        xEventGroupWaitBits(xPipelineEvents, EVT_FILTERED_READY,
+                            pdTRUE, pdFALSE,
+                            pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+
+        uint16_t temp;
+        while (xQueueReceive(queue_filtered, &temp, 0) == pdPASS) {
+            filtered_val = temp;
+        }
+
+        uint8_t bar_height = (uint8_t)((uint32_t)filtered_val * 48 / 4095);
+
+        ssd1306_clear();
+        ssd1306_draw_bar(10, 40, bar_height);
+
+        char text_buf[16];
+        snprintf(text_buf, sizeof(text_buf), "%u", filtered_val);
+        ssd1306_draw_string(60, 3, text_buf);
+        ssd1306_update();
+
+        /* Log queue stats */
+        UBaseType_t raw_fill  = uxQueueMessagesWaiting(queue_raw);
+        UBaseType_t filt_fill = uxQueueMessagesWaiting(queue_filtered);
+
+        ESP_LOGI(TAG, "ADC:%u Q0:%u Q1:%u miss:%lu/%lu",
+                 filtered_val, (unsigned)raw_fill, (unsigned)filt_fill,
+                 (unsigned long)missed_raw, (unsigned long)missed_filtered);
+
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+    }
+}
+
+/* ---------- Main ---------- */
+void app_main(void) {
+    adc_setup();
+    i2c_setup();
+
+    queue_raw       = xQueueCreate(QUEUE_DEPTH, sizeof(uint16_t));
+    queue_filtered  = xQueueCreate(QUEUE_DEPTH, sizeof(uint16_t));
+    xPipelineEvents = xEventGroupCreate();
+
+    if (queue_raw == NULL || queue_filtered == NULL
+        || xPipelineEvents == NULL) {
+        ESP_LOGE(TAG, "Failed to create RTOS objects");
+        return;
+    }
+
+    xTaskCreate(vProducerTask, "Producer", 2048, NULL, 2, NULL);
+    xTaskCreate(vFilterTask,   "Filter",   2048, NULL, 2, NULL);
+    xTaskCreate(vDisplayTask,  "Display",  4096, NULL, 1, NULL);
+
+    ESP_LOGI(TAG, "Sensor pipeline started");
+}
+```
+
+Note the key ESP32 differences: the ESP-IDF provides its own ADC and I2C drivers, stack sizes are larger (ESP32 tasks need at least 2048 bytes), and `app_main` replaces the bare-metal `main` because the ESP-IDF scheduler is already running when `app_main` is called.
+
+</TabItem>
+</Tabs>
+
+### Pipeline Data Flow
+
+```
+┌───────────┐  uint16_t  ┌───────────┐  uint16_t  ┌───────────┐
+│ Producer  │──────────>│  Filter   │──────────>│  Display  │
+│ (ADC,     │ queue_raw │ (moving   │ queue_filt│ (OLED bar │
+│  100 Hz)  │ depth=16  │  average) │ depth=16  │  graph)   │
+│ Priority 2│           │ Priority 2│           │ Priority 1│
+└───────────┘           └───────────┘           └───────────┘
+       │                      │                      │
+       └──── EVT_RAW_READY ──>│                      │
+                              └── EVT_FILTERED_READY >│
+```
+
+The event group bits add an extra signaling layer on top of the queues. The filter task does not spin-poll `xQueueReceive`; it sleeps until `EVT_RAW_READY` is set, then drains whatever is available. This keeps CPU usage minimal.
+
+## Breaking It: Queue Overflow
+
+<InArticleAd />
+
+
+The best way to understand queue sizing is to deliberately break the pipeline. Make the filter task artificially slow so the producer fills the raw queue faster than the filter can drain it.
+
+### Step 1: Slow Down the Filter
+
+Add a 50 ms delay inside the filter loop so it processes at most 20 samples per second, while the producer pushes 100 per second:
+
+```c
+static void vFilterTask_Slow(void *pvParameters) {
+    uint16_t window[FILTER_WINDOW];
+    uint8_t  idx = 0;
+    uint8_t  filled = 0;
+    uint16_t raw_val, avg;
+
+    memset(window, 0, sizeof(window));
+
+    for (;;) {
+        xEventGroupWaitBits(xPipelineEvents, EVT_RAW_READY,
+                            pdTRUE, pdFALSE, portMAX_DELAY);
+
+        /* Process only ONE item, then waste time */
+        if (xQueueReceive(queue_raw, &raw_val, 0) == pdPASS) {
+            window[idx] = raw_val;
+            idx = (idx + 1) % FILTER_WINDOW;
+            if (filled < FILTER_WINDOW) filled++;
+
+            uint32_t sum = 0;
+            for (uint8_t i = 0; i < filled; i++) sum += window[i];
+            avg = (uint16_t)(sum / filled);
+
+            xQueueSend(queue_filtered, &avg, pdMS_TO_TICKS(5));
+            xEventGroupSetBits(xPipelineEvents, EVT_FILTERED_READY);
+        }
+
+        /* Simulate slow processing */
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+```
+
+### Step 2: Observe the Serial Output
+
+You will see the `Q0` (raw queue fill level) climb steadily from 0 toward 16, and the `miss` counter start incrementing once the queue is full:
+
+```
+ADC:2048 Q0:0  Q1:0 miss:0/0
+ADC:2050 Q0:5  Q1:0 miss:0/0
+ADC:2047 Q0:10 Q1:0 miss:0/0
+ADC:2051 Q0:16 Q1:1 miss:0/0
+ADC:2049 Q0:16 Q1:1 miss:3/0
+ADC:2052 Q0:16 Q1:1 miss:8/0
+```
+
+### Step 3: Fix It
+
+Three approaches, in order of preference:
+
+1. **Fix the root cause.** Remove the artificial delay. If the filter is genuinely slow, optimize its algorithm (use a running sum instead of recomputing the entire window each time).
+
+2. **Increase queue depth.** If bursts are temporary, a deeper queue absorbs them. But this only delays the problem if the average rate mismatch is permanent.
+
+3. **Throttle the producer.** If you cannot speed up the consumer, the producer must slow down or skip samples. Use `xQueueSend` with a zero timeout and accept that some samples will be dropped.
+
+## Project Structure
+
+<InArticleAd />
+
+
+<FileTree>
+- sensor-pipeline/
+  - src/
+    - main.c
+    - ssd1306.c
+    - ssd1306.h
+    - i2c.c
+    - i2c.h
+    - uart.c
+    - uart.h
+    - clock.c
+    - clock.h
+  - include/
+    - FreeRTOSConfig.h
+  - Makefile
+  - platformio.ini
+</FileTree>
+
+### FreeRTOSConfig.h Key Settings
+
+These settings must be enabled for queues, event groups, and the features used in this lesson:
+
+```c
+#define configUSE_PREEMPTION            1
+#define configUSE_EVENT_GROUPS          1
+#define configSUPPORT_DYNAMIC_ALLOCATION 1
+#define configTOTAL_HEAP_SIZE           ((size_t)(8 * 1024))
+#define configMAX_PRIORITIES            5
+#define configMINIMAL_STACK_SIZE        128
+#define configTICK_RATE_HZ              1000
+```
+
+The total heap must be large enough for two queues (each `QUEUE_DEPTH * sizeof(uint16_t)` plus overhead), three task stacks, and the event group. On the Blue Pill with 20 KB of SRAM, 8 KB for the FreeRTOS heap leaves enough room for the SSD1306 framebuffer and other static data.
+
+### PlatformIO Configuration
+
+```ini
+; platformio.ini
+[env:bluepill]
+platform = ststm32
+board = bluepill_f103c8
+framework = stm32cube
+build_flags =
+    -DUSE_HAL_DRIVER
+    -DSTM32F103xB
+
+[env:esp32]
+platform = espressif32
+board = esp32dev
+framework = espidf
+```
+
+## Experiments
+
+<InArticleAd />
+
+
+<CardGrid>
+  <Card title="Add a Second Sensor" icon="star">
+    Wire a second potentiometer to another ADC channel (PA1 on STM32, GPIO35 on ESP32). Create a second producer task and a second raw queue. Have the filter task pull from both queues and compute independent averages. Display both values as side-by-side bars on the OLED.
+  </Card>
+
+  <Card title="Implement Queue Peek" icon="rocket">
+    Modify the display task to use `xQueuePeek` instead of `xQueueReceive` so it reads the latest filtered value without removing it. Then add a second consumer task that logs data to serial using `xQueueReceive`. Verify that both consumers see the data.
+  </Card>
+
+  <Card title="Stream Buffer for Serial Logging" icon="setting">
+    Replace the direct `uart_send_string` calls in the display task with writes to a stream buffer. Create a dedicated logging task that drains the stream buffer and sends data over UART. This decouples display rendering from serial I/O, preventing UART blocking from slowing down the display.
+  </Card>
+
+  <Card title="Measure Queue Latency" icon="open-book">
+    Timestamp each sample in the producer using `xTaskGetTickCount` and compare it to the tick count when the display task receives it. Log the latency in milliseconds. Vary the queue depth and filter window size, then observe how each parameter affects end-to-end latency.
+  </Card>
+</CardGrid>
+
+:::tip[Next Lesson]
+In [Lesson 4: Semaphores, Mutexes, and Synchronization](/education/rtos-programming/semaphores-mutexes-synchronization), you will tackle the next layer of RTOS coordination. When multiple tasks share a resource (like the I2C bus), queues alone are not enough. You will learn binary semaphores, counting semaphores, mutexes with priority inheritance, and deliberately trigger priority inversion and deadlock to understand why these primitives exist.
+:::
+
+<RtosProgrammingComments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />
