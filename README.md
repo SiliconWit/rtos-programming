@@ -1,0 +1,87 @@
+---
+title: "RTOS Programming - Collaboration Guide"
+description: "Contributing guide for RTOS Programming course content"
+tableOfContents: true
+sidebar:
+  order: 999
+---
+
+# RTOS Programming
+
+![Build](https://img.shields.io/badge/build-passing-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Contributors Welcome](https://img.shields.io/badge/contributors-welcome-orange)
+
+A course on real-time operating systems covering scheduling, synchronization, and memory management. You will work through FreeRTOS fundamentals and finish with an introduction to Zephyr RTOS.
+
+## Lessons
+
+| # | Title |
+|---|-------|
+| 1 | Real-Time Systems Concepts |
+| 2 | Tasks Scheduling and Context Switching |
+| 3 | Queues and Inter-Task Communication |
+| 4 | Semaphores Mutexes and Synchronization |
+| 5 | Memory Management and Safety |
+| 6 | Software Timers and Interrupt Management |
+| 7 | Debugging and Profiling RTOS Applications |
+| 8 | Zephyr RTOS Introduction |
+
+## File Structure
+
+```
+rtos-programming/
+├── lesson-0.mdx        # Course introduction
+├── lesson-1.mdx        # Real-Time Systems Concepts
+├── lesson-2.mdx        # Tasks Scheduling and Context Switching
+├── lesson-3.mdx        # Queues and Inter-Task Communication
+├── lesson-4.mdx        # Semaphores Mutexes and Synchronization
+├── lesson-5.mdx        # Memory Management and Safety
+├── lesson-6.mdx        # Software Timers and Interrupt Management
+├── lesson-7.mdx        # Debugging and Profiling RTOS Applications
+├── lesson-8.mdx        # Zephyr RTOS Introduction
+└── README.md
+```
+
+## How to Contribute
+
+1. Fork the repository: [SiliconWit/rtos-programming](https://github.com/SiliconWit/rtos-programming)
+2. Create a feature branch: `git checkout -b feature/your-topic`
+3. Make your changes and commit with a clear message
+4. Push to your fork and open a Pull Request against `main`
+5. Describe what you changed and why in the PR description
+
+## Content Standards
+
+- All lesson files use `.mdx` format
+- Do not use `<BionicText>` in this course
+- Code blocks should include a title attribute:
+  ````mdx
+  ```c title="task_example.c"
+  xTaskCreate(vTaskFunction, "Task1", 128, NULL, 1, NULL);
+  ```
+  ````
+- Use Starlight components (`<Tabs>`, `<TabItem>`, `<Steps>`, `<Card>`) where appropriate
+- Keep paragraphs concise and focused on practical application
+- Include working code examples that readers can run directly
+
+## Local Development
+
+Clone the main site repository and initialize submodules:
+
+```bash
+git clone --recurse-submodules <main-repo-url>
+cd siliconwit-com
+npm install
+npm run dev
+```
+
+To test a production build:
+
+```bash
+npm run build
+```
+
+## License
+
+This course content is released under the [MIT License](LICENSE).
