@@ -63,6 +63,21 @@ Traditional embedded debugging relies on breakpoints and printf statements. Both
 
 Printf debugging has a subtler problem. UART transmission takes real time. At 115200 baud, printing a 40-character status line takes about 3.5 ms. That is 3.5 ms during which the calling task holds the CPU (or blocks on UART), other tasks do not run, and the scheduler's timing is completely different from the original code. The classic name for this is a **Heisenberg bug**: observing it changes the system enough to make it disappear. You add a printf, the deadlock stops happening, you remove the printf, the deadlock comes back.
 
+```text
+  Deadlock: Two Mutexes, Opposite Order
+  ──────────────────────────────────────────
+  Task A                    Task B
+  ──────                    ──────
+  take(mutex_1) ✓           take(mutex_2) ✓
+  take(mutex_2) ← BLOCKED   take(mutex_1) ← BLOCKED
+       │                         │
+       └─── waiting for B ───────┘
+            B waiting for A
+            = DEADLOCK (both stuck forever)
+
+  Fix: always acquire mutexes in the same order.
+```
+
 What you need instead is **trace-based debugging**. Trace tools record timestamped events (task switches, mutex takes, queue operations) into a RAM buffer with minimal overhead, typically a few microseconds per event. After the bug occurs, you examine the trace to see exactly which task did what and when. The system ran at nearly full speed, so the timing relationships that cause the bug are preserved in the recording.
 
 ## FreeRTOS Runtime Statistics
@@ -86,6 +101,22 @@ extern uint32_t ulGetRunTimeCounterValue(void);
 
 #define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS() vConfigureTimerForRunTimeStats()
 #define portGET_RUN_TIME_COUNTER_VALUE()          ulGetRunTimeCounterValue()
+```
+
+```text
+  Tracealyzer / SystemView Timeline
+  ──────────────────────────────────────────
+  Time (ms)  0    5    10   15   20   25
+  Task A:    ▓▓▓──────▓▓▓──────▓▓▓─────
+  Task B:    ───▓▓▓▓──────▓▓▓▓──────▓▓▓
+  Task C:    ──────────▓─────────────────
+  ISR:       ─▲────▲────▲────▲────▲────▲
+              │    │    │    │    │    │
+              SysTick interrupts (1 kHz)
+
+  Trace captures every context switch, mutex
+  take/give, queue send/receive as timestamped
+  events in a RAM buffer.
 ```
 
 The stats timer must tick faster than the RTOS tick (typically 1 kHz). A 10x to 100x factor gives good resolution. We will use TIM2 on the STM32 running at 100 kHz (10 us resolution).

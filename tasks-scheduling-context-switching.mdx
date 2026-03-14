@@ -76,6 +76,27 @@ Every FreeRTOS task exists in one of four states at any given moment. Understand
 
 **Suspended:** The task has been explicitly removed from scheduling by a call to `vTaskSuspend()`. It will not run, and no timeout will wake it. Only an explicit call to `vTaskResume()` (or `xTaskResumeFromISR()` from an interrupt) moves it back to Ready.
 
+```text
+  FreeRTOS Task State Machine
+  ────────────────────────────────────────
+              vTaskResume()
+       ┌─────────────────────┐
+       │                     ▼
+  ┌────────────┐       ┌───────────┐
+  │ SUSPENDED  │       │   READY   │◄──────────┐
+  └────────────┘       └─────┬─────┘           │
+       ▲                     │ scheduler        │
+       │ vTaskSuspend()      │ selects          │
+       │                     ▼                  │
+  ┌────────────┐       ┌───────────┐   preempted│
+  │  BLOCKED   │◄──────│  RUNNING  │───────────►│
+  │ (waiting   │ block │ (on CPU)  │
+  │  for event)│ API   └───────────┘
+  └────────────┘
+       │ event occurs
+       └──────────────────────►READY
+```
+
 ### State Transitions
 
 | From | To | Triggered By |
@@ -135,6 +156,17 @@ The idle task is a special task created automatically by FreeRTOS at priority 0 
 #define configMAX_PRIORITIES    5
 ```
 
+```text
+  Priority-Based Preemptive Scheduling
+  ─────────────────────────────────────
+  Priority 3 │ Emergency ░░░░▓▓▓▓▓▓░░░░░░░░░
+  Priority 2 │ Pedestrian ░░░░░░░░░░░░▓▓░░░░░
+  Priority 1 │ LightCycle ▓▓▓▓░░░░░░░░░░▓▓▓▓▓
+  Priority 0 │ Idle       ░░░░░░░░░░░░░░░░░░░
+             └────────────────────────────────►
+              ▓ = Running   ░ = Ready/Blocked
+```
+
 With the traffic light controller, this means:
 - The emergency task (priority 3) will always preempt both other tasks immediately
 - The pedestrian task (priority 2) will preempt the light cycle task (priority 1)
@@ -151,6 +183,18 @@ Time slicing is controlled by a configuration macro:
 
 ```c
 #define configUSE_TIME_SLICING    1   /* 1 = enabled (default) */
+```
+
+```text
+  Round-Robin Time Slicing (equal priority)
+  ──────────────────────────────────────────
+  Tick   1ms  1ms  1ms  1ms  1ms  1ms
+         ┌────┬────┬────┬────┬────┬────┐
+  Task A │ ▓▓ │    │ ▓▓ │    │ ▓▓ │    │
+  Task B │    │ ▓▓ │    │ ▓▓ │    │ ▓▓ │
+         └────┴────┴────┴────┴────┴────┘
+  Both at same priority: scheduler
+  alternates every tick (1 ms slice).
 ```
 
 When enabled, the tick interrupt (SysTick on Cortex-M) checks at every tick whether another task of the same priority is Ready. If so, a context switch occurs. If disabled, a running task will continue until it blocks or is preempted by a higher-priority task, even if equal-priority tasks are Ready.

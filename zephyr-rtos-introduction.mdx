@@ -81,6 +81,28 @@ The project started at Wind River as Rocket OS, was open-sourced in 2016, and ha
 | Licensing | MIT | Apache 2.0 |
 | Scope | Kernel + minimal extras | Full OS with subsystems |
 
+```text
+  FreeRTOS vs Zephyr Scope
+  ──────────────────────────────────────────
+  FreeRTOS:
+  ┌───────────────┐
+  │  Task Sched.  │  You add everything else:
+  │  Queues       │  HAL, drivers, TCP/IP,
+  │  Semaphores   │  BLE, USB, filesystem...
+  │  Timers       │
+  └───────────────┘
+
+  Zephyr:
+  ┌───────────────────────────────────────┐
+  │  Kernel + Scheduler                   │
+  │  Devicetree + Kconfig                 │
+  │  GPIO, I2C, SPI, UART drivers         │
+  │  TCP/IP, BLE, USB, CAN               │
+  │  Logging, Shell, Filesystem           │
+  │  600+ board support packages          │
+  └───────────────────────────────────────┘
+```
+
 FreeRTOS gives you a lean kernel and maximum freedom. Zephyr gives you a complete platform with opinions about how hardware should be described and configured. Neither approach is inherently better; it depends on your project requirements.
 
 ## Installing Zephyr
@@ -219,6 +241,32 @@ target_sources(app PRIVATE src/main.c)
 ```
 
 The `find_package(Zephyr)` call is where the magic happens. It pulls in the entire Zephyr build system, including the devicetree compiler, Kconfig processing, and toolchain configuration. Your application is built as a library (`app`) that gets linked against the Zephyr kernel.
+
+```text
+  Zephyr Build Pipeline
+  ──────────────────────────────────────────
+  Board .dts          prj.conf
+  + your .overlay     (Kconfig)
+       │                  │
+       ▼                  ▼
+  ┌──────────┐     ┌──────────────┐
+  │  dtc     │     │  Kconfig     │
+  │ compiler │     │  processor   │
+  └────┬─────┘     └──────┬───────┘
+       │                  │
+       ▼                  ▼
+  devicetree_        .config
+  generated.h       (final config)
+       │                  │
+       └────────┬─────────┘
+                ▼
+         ┌────────────┐
+         │  CMake +   │
+         │  Compiler  │◄── src/main.c
+         └─────┬──────┘
+               ▼
+          zephyr.elf ──► west flash
+```
 
 ### How West Builds Your Project
 

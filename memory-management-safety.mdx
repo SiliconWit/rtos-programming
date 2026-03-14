@@ -69,6 +69,25 @@ Three failure modes dominate embedded memory bugs:
 
 **Memory leaks.** Forgetting to free allocated memory is less obvious on an embedded system because there is no process exit to reclaim everything. The leak accumulates across days or weeks of continuous operation until the heap is exhausted.
 
+```text
+  STM32F103 Memory Map (20 KB SRAM)
+  ──────────────────────────────────
+  0x2000_5000 ┌──────────────────┐
+              │   FreeRTOS Heap  │ configTOTAL_HEAP
+              │   (task stacks,  │ = 10 KB
+              │    queues, TCBs) │
+  0x2000_2800 ├──────────────────┤
+              │   .bss + .data   │ Global variables
+              │   (static alloc) │ SSD1306 framebuf
+  0x2000_0400 ├──────────────────┤
+              │   MSP (main      │ Used before
+              │   stack pointer) │ scheduler starts
+  0x2000_0000 └──────────────────┘
+
+  Every byte counts. A stack overflow in one
+  task silently corrupts another task's data.
+```
+
 The solution used by most safety-critical embedded systems is straightforward: avoid dynamic allocation entirely. Allocate everything at startup, use fixed-size buffers, and verify at compile time that everything fits. FreeRTOS supports this approach through its static allocation API, and this lesson is built around that philosophy.
 
 ## FreeRTOS Heap Schemes
@@ -85,6 +104,21 @@ FreeRTOS does not use the standard C library `malloc` and `free` by default. Ins
 | heap_3 | Yes | Yes | Depends on libc | Wraps standard `malloc`/`free` with scheduler suspension for thread safety. Useful when you need compatibility with third-party libraries that call `malloc`. |
 | heap_4 | Yes | Yes | Yes | General-purpose embedded use. Combines adjacent free blocks to reduce fragmentation. The most common choice for non-safety-critical applications. |
 | heap_5 | Yes | Yes | Yes | Like heap_4 but supports non-contiguous memory regions. Required when your MCU has multiple RAM banks (e.g., STM32F4 with CCM and main SRAM). |
+
+```text
+  Heap Scheme Decision Tree
+  ────────────────────────────────────
+  Create objects at startup only?
+    YES ──► heap_1 (no free, simplest)
+    NO  ──► Same-size blocks?
+              YES ──► heap_2 (no coalesce)
+              NO  ──► Multiple RAM banks?
+                        YES ──► heap_5
+                        NO  ──► Need libc malloc?
+                                  YES ──► heap_3
+                                  NO  ──► heap_4
+                                          (best general)
+```
 
 ### Selecting a Heap Scheme
 

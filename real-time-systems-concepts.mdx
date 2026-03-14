@@ -84,6 +84,22 @@ A late result is worthless but does not cause catastrophic failure. The system s
 
 Most embedded systems you will build in practice fall into the soft or firm category. True hard real-time systems require formal verification, certified toolchains, and exhaustive testing. The techniques in this lesson (jitter measurement, WCET analysis, rate-monotonic scheduling) apply to all three categories, but they are essential for hard real-time work.
 
+```text
+ Deadline Severity Spectrum
+ ─────────────────────────────────────────────
+  Soft               Firm              Hard
+  (degraded          (result           (system
+   quality)           discarded)        failure)
+
+  Audio stream       Sensor sample     Airbag
+  GUI refresh        Packet timeout    Pacemaker
+  Video frame        Price window      Motor ctrl
+
+  ◄── tolerable ──► ◄── useless ──► ◄── danger ──►
+  if late             if late           if late
+ ─────────────────────────────────────────────
+```
+
 ## The Super-Loop Problem
 
 <InArticleAd />
@@ -107,6 +123,23 @@ int main(void) {
 This is called a **super loop** (or polling loop, or bare-metal loop). It is simple, requires no OS, and works well for many applications. But it has a fundamental timing problem.
 
 The loop period is the sum of all task execution times. In the example above, one full iteration takes roughly 2 + 8 + 0.1 + 3 = 13.1 ms. The temperature sensor is read once every 13.1 ms. If you add a new function that takes 5 ms, the sensor now waits 18.1 ms between reads. Every task in the loop is affected by every other task.
+
+```text
+  Super Loop Timing (each task blocks all others)
+  ──────────────────────────────────────────────
+  │  read_temp  │update_lcd │ btn │ serial │
+  │    2 ms     │   8 ms    │0.1ms│  3 ms  │
+  ├─────────────┼───────────┼─────┼────────┤
+  0            2           10   10.1      13.1 ms
+  │◄──────── one loop iteration ─────────►│
+
+  If update_lcd grows to 12 ms:
+  │  read_temp  │  update_lcd   │ btn │serial│
+  │    2 ms     │    12 ms      │0.1ms│ 3 ms │
+  ├─────────────┼───────────────┼─────┼──────┤
+  0            2              14   14.1    17.1 ms
+  Loop period grew by 4 ms. Every task affected.
+```
 
 This coupling creates **jitter**: variation in the time between successive executions of the same function. If `update_lcd_display()` sometimes takes 8 ms and sometimes takes 12 ms (because of conditional rendering), the sensor read interval varies by 4 ms, and the serial report interval varies by the same amount. No task can maintain a stable period independent of the others.
 
@@ -400,6 +433,18 @@ Once you know the WCET of each task, you can use **Rate-Monotonic Analysis** to 
 ### The Rule
 
 Assign the highest priority to the task with the shortest period. This is the rate-monotonic priority assignment, and it is provably optimal for fixed-priority preemptive scheduling of independent periodic tasks.
+
+```text
+  Rate-Monotonic Priority Assignment
+  ───────────────────────────────────
+  Shortest period  ──►  Highest priority
+
+  Task       Period    Priority
+  ─────────  ──────    ────────
+  Toggle LED   1 ms    3 (highest)
+  Read sensor  5 ms    2
+  Send report 20 ms    1 (lowest)
+```
 
 ### The Utilization Bound Test
 

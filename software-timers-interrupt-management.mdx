@@ -78,6 +78,21 @@ xEventGroupWaitBits(grp, bits, ...);          /* Blocks until bits set */
 
 The kernel detects some of these violations through `configASSERT`, but only if you have assertions enabled. Without them, the system simply freezes with no indication of what went wrong.
 
+```text
+  Deferred Interrupt Processing
+  ────────────────────────────────────────
+  Hardware         ISR (fast)        Task (slow)
+  ─────────       ──────────       ───────────
+  Button ──IRQ──► Ack interrupt
+                  Give semaphore ─► Wake from block
+                  Return             Read GPIO
+                  (< 1 us)           Debounce logic
+                                     Update LEDs
+                                     Log event
+                                     (runs at task
+                                      priority)
+```
+
 The solution is **deferred interrupt processing**: the ISR does the absolute minimum (acknowledge the hardware, signal a task) and returns immediately. A regular FreeRTOS task picks up where the ISR left off and does the actual work.
 
 ## ISR-Safe API Calls
@@ -96,6 +111,23 @@ Every blocking FreeRTOS function has a counterpart that is safe to call from an 
 | `xEventGroupSetBits()` | `xEventGroupSetBitsFromISR()` |
 | `xTimerStartFromISR()` | `xTimerStartFromISR()` |
 | `xTimerResetFromISR()` | `xTimerResetFromISR()` |
+
+```text
+  Timer Service Task Architecture
+  ────────────────────────────────────────
+  App Code          Timer Queue        Timer Task
+  ────────          ───────────        ──────────
+  xTimerStart() ──► ┌─────────┐
+  xTimerStop()  ──► │ command  │ ──► Process cmd
+  xTimerReset() ──► │ queue    │     Call callback
+                    └─────────┘     (timer context,
+                                     not ISR context)
+
+  Timer callbacks run in the Timer Service Task
+  at configTIMER_TASK_PRIORITY. They must not
+  block, but they CAN call regular (non-ISR)
+  FreeRTOS APIs.
+```
 
 All FromISR functions share a common pattern. They accept a pointer to a `BaseType_t` variable called `pxHigherPriorityTaskWoken`. The kernel sets this variable to `pdTRUE` if the API call unblocked a task with a higher priority than the currently running task. After your ISR finishes its work, you check this flag and call `portYIELD_FROM_ISR()` to request an immediate context switch:
 

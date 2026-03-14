@@ -72,9 +72,34 @@ I2C is a shared bus. Only one master transaction can use the SDA and SCL lines a
 4. **Data corruption occurs.** Task B reads bytes that are a mix of its own response and leftover bits from Task A's interrupted transaction. Task A, when it resumes, tries to continue clocking data from a slave that has already reset or moved to a different register. Both tasks get garbage values.
 </Steps>
 
+```text
+  I2C Bus Collision (no mutex protection)
+  ────────────────────────────────────────
+  Task A: START─ADDR─[DATA─DATA─  (preempted!)
+                          │
+  Task B:                 START─ADDR─DATA─STOP
+                          │
+  Task A resumes:    ─DATA]─STOP   ◄── garbage!
+
+  Both tasks get corrupted data because
+  the bus transaction was interrupted.
+```
+
 This is not a rare edge case. With three tasks reading at different rates (500 ms, 1000 ms, 2000 ms), collisions happen within seconds. The symptoms are intermittent: sometimes the temperature reads as -40 C, sometimes the humidity jumps to 255%, sometimes the I2C bus locks up entirely and requires a power cycle.
 
 The solution is to ensure only one task accesses the I2C bus at a time. FreeRTOS provides several synchronization primitives for this, each suited to different situations.
+
+```text
+  Mutex-Protected I2C Access
+  ──────────────────────────────────────────
+  Task A:  take(mutex)──I2C read──give(mutex)
+  Task B:  take(mutex)──blocked...──I2C read──give()
+  Task C:  take(mutex)──blocked............──I2C read
+
+  Timeline:
+  ├──── A has bus ────┤── B has bus ──┤─ C ─┤
+  Only one task touches the I2C bus at a time.
+```
 
 ## Binary Semaphores
 

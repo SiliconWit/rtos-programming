@@ -192,6 +192,23 @@ void vConsumerTask(void *pvParameters) {
 
 The consumer has no `vTaskDelay` because `xQueueReceive` with `portMAX_DELAY` already puts the task to sleep when the queue is empty. The task wakes exactly when new data arrives.
 
+```text
+  Multi-Stage Pipeline with Queues
+  ─────────────────────────────────────────
+  ┌──────────┐ uint16 ┌──────────┐ uint16
+  │ Producer ├───────►│  Queue   ├───────►
+  │ (ADC,    │        │ (FIFO,   │
+  │  100 Hz) │        │  depth=16│
+  └──────────┘        └──────────┘
+
+  Queue internals:
+  ┌────┬────┬────┬────┬────┬────┐
+  │ 12 │ 47 │ 83 │    │    │    │ ◄─ 3 items
+  └────┴────┴────┴────┴────┴────┘   in queue
+    ▲ head              tail ▲
+    (receive)            (send)
+```
+
 ## Queue Sizing
 
 <InArticleAd />
@@ -278,6 +295,22 @@ xMessageBufferSend(xMsgBuf, &sensor_packet, sizeof(sensor_packet),
 /* Receive: returns the number of bytes in this message */
 size_t len = xMessageBufferReceive(xMsgBuf, rx_buf, sizeof(rx_buf),
                                     portMAX_DELAY);
+```
+
+```text
+  IPC Mechanism Selection Guide
+  ─────────────────────────────────────────
+  Fixed-size items?
+    YES ──► Queue (xQueueSend / xQueueReceive)
+    NO  ──► Variable length?
+              YES ──► Message Buffer (preserves
+              │       message boundaries)
+              NO  ──► Stream Buffer (raw bytes,
+                      like a ring buffer)
+
+  Just signaling, no data?
+    ──► Event Group (multi-bit flags)
+    ──► Binary Semaphore (single signal)
 ```
 
 ### When to Use Each
