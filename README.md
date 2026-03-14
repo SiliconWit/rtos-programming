@@ -12,6 +12,8 @@ sidebar:
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Contributors Welcome](https://img.shields.io/badge/contributors-welcome-orange)
 
+**Read this course at:** [https://siliconwit.com/education/rtos-programming/](https://siliconwit.com/education/rtos-programming/)
+
 A course on real-time operating systems covering scheduling, synchronization, and memory management. You will work through FreeRTOS fundamentals and finish with an introduction to Zephyr RTOS.
 
 ## Lessons
