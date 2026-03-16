@@ -885,6 +885,34 @@ To solidify your understanding, let us walk through exactly what happens when th
 7. The light cycle task, now Ready, becomes the highest-priority Ready task and resumes its normal sequence from wherever it left off in `vTaskDelay()`.
 </Steps>
 
+```mermaid
+%%{init: {'sequence': {'mirrorActors': false}}}%%
+sequenceDiagram
+    participant BP as Button Poll (P1)
+    participant EM as Emergency (P3)
+    participant LC as Light Cycle (P1)
+    participant SCH as Scheduler
+
+    Note over LC: Green phase running
+    LC->>LC: vTaskDelay(3000)
+    BP->>BP: Wakes from 50ms delay
+    BP->>BP: Reads GPIO, button pressed
+    BP->>EM: xTaskNotify()
+    SCH-->>BP: Preempt (P3 > P1)
+    SCH-->>EM: Switch to Emergency
+    EM->>EM: Suspend LightCycle
+    EM->>EM: Suspend Pedestrian
+    loop 10s flash sequence
+        EM->>EM: Set red LED
+        EM->>EM: vTaskDelay(250)
+    end
+    EM->>EM: Resume LightCycle
+    EM->>EM: Resume Pedestrian
+    EM->>EM: xTaskNotifyWait() (blocks)
+    SCH-->>LC: Switch to LightCycle
+    Note over LC: Resumes normal sequence
+```
+
 The key insight is that the entire preemption chain happens automatically. You do not write any scheduling code. You simply assign priorities, and the FreeRTOS kernel handles the rest.
 
 ## Project Structure

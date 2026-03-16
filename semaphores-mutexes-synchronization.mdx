@@ -688,7 +688,13 @@ static void vPressureTask(void *pvParameters)
              * and block the high-priority task indirectly.
              */
             printf("[PRESS ] Holding lock during slow read...\r\n");
-            HAL_Delay(50);  /* Simulate slow I2C transaction */
+            HAL_Delay(50);  /* Simulate slow I2C transaction.
+                             * NOTE: HAL_Delay uses SysTick polling.
+                             * If SysTick is owned by FreeRTOS, this
+                             * will hang. Acceptable here only because
+                             * this DEMO_MODE path deliberately shows
+                             * the priority inversion bug. Production
+                             * code should use vTaskDelay() instead. */
 #endif
 
             printf("[PRESS ] %.1f hPa, releasing mutex (tick %lu)\r\n",

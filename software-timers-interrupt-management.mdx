@@ -843,7 +843,7 @@ static void IRAM_ATTR gpio_isr_handler(void *arg) {
     }
 
     if (xWoken) {
-        portYIELD_FROM_ISR();
+        portYIELD_FROM_ISR(xWoken);
     }
 }
 
@@ -900,7 +900,8 @@ void vDebounceCallback(TimerHandle_t xTimer) {
 
     uint8_t still_pressed = read_button(btn);
 
-    taskENTER_CRITICAL(&(portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED);
+    static portMUX_TYPE debounce_mux = portMUX_INITIALIZER_UNLOCKED;
+    taskENTER_CRITICAL(&debounce_mux);
     if (still_pressed) {
         shared_state.button_active[btn] = 1;
         shared_state.press_count[btn]++;
@@ -908,7 +909,7 @@ void vDebounceCallback(TimerHandle_t xTimer) {
     } else {
         shared_state.button_active[btn] = 0;
     }
-    taskEXIT_CRITICAL(&(portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED);
+    taskEXIT_CRITICAL(&debounce_mux);
 }
 
 /* ---------- Button Handler Task (Priority 3) ---------- */
