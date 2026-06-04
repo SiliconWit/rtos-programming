@@ -986,6 +986,10 @@ Note the key ESP32 differences: the ESP-IDF provides its own ADC and I2C drivers
 
 The event group bits add an extra signaling layer on top of the queues. The filter task does not spin-poll `xQueueReceive`; it sleeps until `EVT_RAW_READY` is set, then drains whatever is available. This keeps CPU usage minimal.
 
+:::tip[Instrument it]
+A queue is the backbone of a reliable monitor. One task does nothing but read the sensor on a strict schedule and drop each sample into the queue; another drains it to an SD card, a screen, or a radio. That decoupling is why a slow flush or a network stall never makes you miss a reading: the sampler keeps its timing while the consumer catches up. Size the queue for the worst-case burst, and the device captures every event it should before it [sends them onward](/education/iot-systems/).
+:::
+
 ## Breaking It: Queue Overflow
 
 <InArticleAd />

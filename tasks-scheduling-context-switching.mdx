@@ -997,6 +997,10 @@ clean:
 .PHONY: all flash clean
 ```
 
+:::tip[Instrument it]
+When a device does several things at once, the sensor read must not wait its turn. Give the sampling task a high enough priority that it preempts housekeeping and runs on time, so your timestamps are honest and fast events are not missed while the CPU was busy redrawing a screen. Scheduling is what keeps measurement trustworthy on a loaded device, the foundation for data you can [actually rely on](https://siliconwit.io).
+:::
+
 ## Experiments
 
 <InArticleAd />
